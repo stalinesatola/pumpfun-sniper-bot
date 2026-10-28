@@ -99,9 +99,7 @@ async fn main() -> Result<()> {
     let sell_tx_cache_pumpswap: Cache<Pubkey, FutureSellTXPS> = Cache::new(1024);
 
     tokio::spawn(async move {
-        let payer: Keypair = Keypair::from_base58_string(
-            "REMOVED_SECRET",
-        );
+        let payer: Keypair = shred_pool_cache::config::keypair_from_base58(&env::var("PVT_KEY")?)?;
 
         let priority_fee: PriorityFeePump = PriorityFeePump {
             unit_limit: 100_000,
@@ -112,17 +110,17 @@ async fn main() -> Result<()> {
         };
 
         let pumpswap_sdk = PumpSwapSDK::new(
-            "https://staked.helius-rpc.com/?api-key=REMOVED_SECRET",
+            &env::var("RPC_URL")?,
             //"https://frankfurt.mainnet.block-engine.jito.wtf",
-            "http://fr.gateway.astralane.io/iris?api-key=REMOVED_SECRET",
+            &env::var("ASTRALANE_URL")?,
             priority_fee,
         )
         .await;
 
         let pumpfun_sdk = PumpFunSDK::new(
-            "https://staked.helius-rpc.com/?api-key=REMOVED_SECRET",
+            &env::var("RPC_URL")?,
             //"https://frankfurt.mainnet.block-engine.jito.wtf",
-            "http://fr.gateway.astralane.io/iris?api-key=REMOVED_SECRET",
+            &env::var("ASTRALANE_URL")?,
             priority_fee,
         )
         .await;
@@ -421,7 +419,7 @@ async fn main() -> Result<()> {
     //     async move {
     //         let manager = GrpcStreamManager::new(
     //             "https://basic.grpc.solanavibestation.com/",
-    //             "REMOVED_SECRET",
+    //             &env::var("GRPC_X_TOKEN")?,
     //             balance_cache_clone,
     //             "https://api.mainnet-beta.solana.com".to_string(),
     //         )

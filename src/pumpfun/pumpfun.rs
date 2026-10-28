@@ -17,7 +17,7 @@ use solana_sdk::signer::Signer;
 use spl_associated_token_account::instruction::create_associated_token_account;
 use std::{str::FromStr, sync::Arc};
 
-use rustls::crypto::{CryptoProvider, ring::default_provider};
+use rustls::crypto::{ring::default_provider, CryptoProvider};
 
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
@@ -222,8 +222,7 @@ impl PumpFunSDK {
             params.token_amount_lamports,
             0,
             &params.creator,
-        )
-        .unwrap();
+        )?;
 
         // Create compute budget instructions
         let compute_unit_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(150_000);
@@ -240,7 +239,7 @@ impl PumpFunSDK {
             &user,
             &[],
         )
-        .unwrap();
+        .map_err(|e| PumpFunError::TransactionError(e.to_string()))?;
 
         // Combine instructions
         let instructions = vec![
@@ -262,6 +261,24 @@ impl PumpFunSDK {
         .map_err(|e| PumpFunError::TransactionError(e.to_string()))?;
 
         Ok(tx)
+    }
+
+    /// Token balance (raw units) of `owner`'s associated token account for `mint`.
+    /// Returns 0 when the account does not exist yet (e.g. the buy has not landed).
+    pub async fn token_balance(&self, owner: &Pubkey, mint: &Pubkey) -> PumpFunResult<u64> {
+        let ata = get_associated_token_address(owner, mint);
+        match self.client.get_token_account_balance(&ata).await {
+            Ok(balance) => balance
+                .amount
+                .parse::<u64>()
+                .map_err(|e| PumpFunError::TransactionError(format!("bad token balance: {e}"))),
+            Err(e) if e.to_string().contains("could not find account") => Ok(0),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn latest_blockhash(&self) -> PumpFunResult<Hash> {
+        Ok(self.client.get_latest_blockhash().await?)
     }
 
     async fn place_tx(self, tx: VersionedTransaction) -> PumpFunResult<String> {
@@ -307,10 +324,7 @@ impl PumpFunSDK {
             creator,
         };
 
-        let tx = self
-            .create_sell_exact_amount_tx(pump_sell_order)
-            .await
-            .unwrap();
+        let tx = self.create_sell_exact_amount_tx(pump_sell_order).await?;
 
         self.place_tx(tx).await
     }
@@ -335,7 +349,7 @@ impl PumpFunSDK {
             creator,
         };
 
-        let tx = self.create_buy_tx(pump_buy_order).await.unwrap();
+        let tx = self.create_buy_tx(pump_buy_order).await?;
 
         let order_placement_res = match self.place_tx(tx.0).await {
             Ok(x) => x,

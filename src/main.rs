@@ -1,30 +1,42 @@
-use std::str::FromStr;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use dotenv::dotenv;
 use env_logger::Env;
 use jito_protos::shredstream::{
-    SubscribeEntriesRequest, shredstream_proxy_client::ShredstreamProxyClient,
+    shredstream_proxy_client::ShredstreamProxyClient, SubscribeEntriesRequest,
 };
-use log::{error, info};
-use moka::sync::Cache;
-use rustls::crypto::CryptoProvider;
+use log::{error, info, warn};
 use rustls::crypto::aws_lc_rs::default_provider;
+use rustls::crypto::CryptoProvider;
+use shred_pool_cache::config::Config;
 use shred_pool_cache::pumpfun::PumpFunSDK;
 use shred_pool_cache::pumpswap::constants::PriorityFeePump;
 use shred_pool_cache::types::*;
-
 use solana_client::rpc_client::SerializableTransaction;
-
-use solana_hash::Hash;
-
+use solana_sdk::instruction::CompiledInstruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
+use solana_sdk::signer::Signer;
 
-use std::env;
-use std::time::{SystemTime, UNIX_EPOCH};
+const PUMP_CREATE_DISCRIMINATOR: [u8; 8] = [24, 30, 200, 40, 5, 28, 7, 119];
 
-use tokio::time::Duration;
-use dotenv::dotenv;
+/// How many times a sell is attempted before giving up on a position.
+const MAX_SELL_ATTEMPTS: u32 = 5;
+/// Pause between sell attempts (about two slots).
+const SELL_RETRY_DELAY: Duration = Duration::from_millis(800);
+
+const MIN_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+/// A stream that stayed up this long is considered healthy and resets the backoff.
+const HEALTHY_STREAM_AGE: Duration = Duration::from_secs(60);
+
+/// A position bought by the sniper that must be sold once `slot_to_exec` is reached.
+struct FutureSell {
+    mint: Pubkey,
+    creator: Pubkey,
+    slot_to_exec: u64,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,219 +44,247 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     if CryptoProvider::get_default().is_none() {
-        default_provider().install_default().unwrap();
+        default_provider()
+            .install_default()
+            .map_err(|_| anyhow::anyhow!("failed to install the default rustls crypto provider"))?;
     }
 
-    #[derive(Clone)]
-    struct FutureSellTXPF {
-        mint: Pubkey,
-        token_amount: u64,
-        slot_to_exec: u64,
-        blockhash: Hash,
-        creator: Pubkey,
-    }
-
-    let sell_tx_cache: Cache<Pubkey, FutureSellTXPF> = Cache::new(1024);
-
-    let bribe_fee = f64::from_str(
-        env::var("BRIBE_FEE")
-            .unwrap_or_else(|_| "0.0001".to_string())
-            .as_str(),
-    )
-    .unwrap();
-    let buy_amount_sol = f64::from_str(
-        env::var("SOL_BUY_AMOUNT")
-            .unwrap_or_else(|_| "0.0001".to_string())
-            .as_str(),
-    )
-    .unwrap();
-
-    let payer: Keypair = Keypair::from_base58_string(
-        env::var("PVT_KEY")
-            .unwrap_or_else(|_| "".to_string())
-            .as_str(),
+    let config = Config::from_env().context("invalid configuration (check your .env)")?;
+    info!(
+        "Wallet {} | buy {} SOL | tip {} SOL | sell after {} slots",
+        config.payer.pubkey(),
+        config.buy_amount_sol,
+        config.bribe_fee,
+        config.sell_delay_slots
     );
 
-    tokio::spawn(async move {
-        let priority_fee: PriorityFeePump = PriorityFeePump {
-            unit_limit: 100_000,
-            unit_price: 25_000_000,
-            buy_tip_fee: 0.001,
-            sell_tip_fee: 0.001,
-            jito_tip_fee: bribe_fee,
-        };
+    let priority_fee = PriorityFeePump {
+        unit_limit: 100_000,
+        unit_price: 25_000_000,
+        buy_tip_fee: 0.001,
+        sell_tip_fee: 0.001,
+        jito_tip_fee: config.bribe_fee,
+    };
+    let sdk = PumpFunSDK::new(&config.rpc_url, &config.astralane_url, priority_fee).await;
 
-        let pumpfun_sdk = PumpFunSDK::new(
-            "https://staked.helius-rpc.com/?api-key=REMOVED_SECRET",
-            // "https://frankfurt.mainnet.block-engine.jito.wtf",
-            "http://fr.gateway.astralane.io/iris?api-key=REMOVED_SECRET",
-            priority_fee,
-        )
-        .await;
+    // Positions waiting to be sold. Kept outside the reconnect loop so that a dropped
+    // stream never makes the bot forget what it holds.
+    let mut pending: Vec<FutureSell> = Vec::new();
 
-        let url = env::var("SHREDSTREAM_URL").unwrap_or_else(|_| "localhost:9999".to_string());
-        let pump_fun_program_id: Pubkey = Pubkey::from_str(PUMP_FUN_PROGRAM_ID_STR).unwrap();
+    let run = async {
+        let mut delay = MIN_RECONNECT_DELAY;
+        loop {
+            let started = Instant::now();
+            match run_stream(&config, &sdk, &mut pending).await {
+                Ok(()) => warn!("Shredstream closed by the server"),
+                Err(e) => error!("Shredstream error: {e:#}"),
+            }
 
-        println!("Connecting to ShredstreamProxy at: {}", url);
+            if started.elapsed() >= HEALTHY_STREAM_AGE {
+                delay = MIN_RECONNECT_DELAY;
+            }
+            warn!("Reconnecting in {:?}", delay);
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(MAX_RECONNECT_DELAY);
+        }
+    };
 
-        let mut client = ShredstreamProxyClient::connect(url).await.unwrap();
-        let mut stream = client
-            .subscribe_entries(SubscribeEntriesRequest {})
-            .await
-            .unwrap()
-            .into_inner();
+    tokio::select! {
+        _ = run => {}
+        _ = tokio::signal::ctrl_c() => {
+            warn!("Ctrl-C received, shutting down");
+        }
+    }
 
-        while let Some(slot_entry) = stream.message().await.unwrap() {
-            let entries = match bincode::deserialize::<Vec<solana_entry::entry::Entry>>(
-                &slot_entry.entries,
-            ) {
+    Ok(())
+}
+
+fn is_create_ix(account_keys: &[Pubkey], ix: &CompiledInstruction) -> bool {
+    ix.data.len() >= 8
+        && ix.data[0..8] == PUMP_CREATE_DISCRIMINATOR
+        && account_keys.get(ix.program_id_index as usize) == Some(&PUMP_FUN_PROGRAM_ID)
+}
+
+/// Connects to the Shredstream proxy and processes slots until the stream ends or fails.
+async fn run_stream(
+    config: &Config,
+    sdk: &PumpFunSDK,
+    pending: &mut Vec<FutureSell>,
+) -> Result<()> {
+    info!(
+        "Connecting to ShredstreamProxy at: {}",
+        config.shredstream_url
+    );
+
+    let mut client = ShredstreamProxyClient::connect(config.shredstream_url.clone())
+        .await
+        .context("could not connect to the Shredstream proxy")?;
+    let mut stream = client
+        .subscribe_entries(SubscribeEntriesRequest {})
+        .await
+        .context("could not subscribe to entries")?
+        .into_inner();
+
+    while let Some(slot_entry) = stream.message().await.context("stream read failed")? {
+        let curr_slot = slot_entry.slot;
+
+        // Sells run in their own tasks so slow RPC calls never stall the stream.
+        let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(pending)
+            .into_iter()
+            .partition(|p| curr_slot >= p.slot_to_exec);
+        *pending = waiting;
+        for position in due {
+            tokio::spawn(sell_position(
+                sdk.clone(),
+                config.payer.insecure_clone(),
+                position,
+            ));
+        }
+
+        let entries =
+            match bincode::deserialize::<Vec<solana_entry::entry::Entry>>(&slot_entry.entries) {
                 Ok(e) => e,
                 Err(e) => {
-                    println!("Deserialization failed with err: {e}");
+                    warn!("Deserialization failed with err: {e}");
                     continue;
                 }
             };
 
-            let curr_slot = slot_entry.slot;
-            for (id, future_tx) in sell_tx_cache.iter() {
-                if curr_slot == future_tx.slot_to_exec {
-                    let sell_tx = pumpfun_sdk
-                        .clone()
-                        .sell(
-                            &future_tx.mint,
-                            future_tx.token_amount,
-                            payer.insecure_clone(),
-                            future_tx.blockhash,
-                            future_tx.creator,
-                        )
-                        .await;
+        for entry in &entries {
+            for tx in &entry.transactions {
+                let account_keys = tx.message.static_account_keys();
+                let Some(create_ix) = tx
+                    .message
+                    .instructions()
+                    .iter()
+                    .find(|ix| is_create_ix(account_keys, ix))
+                else {
+                    continue;
+                };
 
-                    match sell_tx {
-                        Ok(signature) => {
-                            info!("Placed PumpFun TX with Signature: {}", signature)
-                        }
-                        Err(e) => error!("Failed to place PumpFun TX {}", e),
+                let signature = tx.get_signature();
+                info!("Found PumpFun Create TX: {}", signature);
+
+                let parsed_txn = match PumpFunTXInfo::from_create_tx(tx, create_ix) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("Could not parse create TX {}: {:?}", signature, e);
+                        continue;
                     }
+                };
 
-                    sell_tx_cache.remove(&id);
-                }
-            }
-
-            for entry in &entries {
-                for tx in &entry.transactions {
-                    // // check if this is a create tx
-                    // let mut is_create_tx = false;
-
-                    let signature = tx.get_signature();
-                    let account_keys = tx.message.static_account_keys();
-
-                    let mut is_create_tx = false;
-
-                    for ix in tx.message.instructions() {
-                        if ix.data.len() < 8 {
-                            continue;
-                        }
-
-                        let program_id = account_keys[ix.program_id_index as usize];
-                        if program_id == pump_fun_program_id {
-                            let data_prefix: [u8; 8] = ix.data[0..8].try_into().unwrap();
-                            if data_prefix == [24, 30, 200, 40, 5, 28, 7, 119] {
-                                info!("Found PumpFun Create TX: {}", signature);
-
-                                is_create_tx = true;
-                            }
-
-                            if !is_create_tx {
-                                continue;
-                            }
-
-                            let parsed_txn_wrapped = PumpFunTXInfo::from_create_tx(tx, ix);
-                            let parsed_txn = parsed_txn_wrapped.unwrap();
-
-                            info!("NEW TX User: {:?} Signature: {}", tx, signature);
-
-                            let amt = parsed_txn.amounts;
-
-                            let buy_amount = match amt {
-                                Amounts::Unknown => continue,
-                                Amounts::BuyAmounts(buy_amounts) => buy_amounts,
-                                Amounts::SellAmounts(_) => {
-                                    continue;
-                                }
-                            };
-
-                            println!("buy_amount: {:?} tx: {:?}", buy_amount, tx);
-                            let swap_res = pumpfun_sdk
-                                .clone()
-                                .buy(
-                                    &parsed_txn.mint,
-                                    buy_amount_sol,
-                                    payer.insecure_clone(),
-                                    parsed_txn.blockhash,
-                                    buy_amount,
-                                    parsed_txn.creator,
-                                )
-                                .await;
-
-                            match swap_res {
-                                Ok(signature) => {
-                                    info!("Placed PumpFun TX with Signature: {}", signature.0);
-                                    sell_tx_cache.insert(
-                                        Pubkey::new_unique(),
-                                        FutureSellTXPF {
-                                            mint: parsed_txn.mint,
-                                            token_amount: signature.1,
-                                            slot_to_exec: curr_slot + 7,
-                                            blockhash: parsed_txn.blockhash,
-                                            creator: parsed_txn.creator,
-                                        },
-                                    );
-                                }
-                                Err(e) => error!("Failed to place PumpFun TX {}", e),
-                            }
-
-                            let curr_time = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .expect("Time went backwards")
-                                .as_millis();
-
-                            info!("Executed TX at: {}", curr_time);
-
-                            break;
-                        }
+                let buy_amount = match parsed_txn.amounts {
+                    Amounts::BuyAmounts(b) if b.base_amount_out > 0 => b,
+                    _ => {
+                        info!(
+                            "Create TX {} has no usable creator buy, skipping",
+                            signature
+                        );
+                        continue;
                     }
+                };
+
+                info!(
+                    "Sniping mint {} (creator {})",
+                    parsed_txn.mint, parsed_txn.creator
+                );
+
+                let swap_res = sdk
+                    .clone()
+                    .buy(
+                        &parsed_txn.mint,
+                        config.buy_amount_sol,
+                        config.payer.insecure_clone(),
+                        parsed_txn.blockhash,
+                        buy_amount,
+                        parsed_txn.creator,
+                    )
+                    .await;
+
+                match swap_res {
+                    Ok((buy_signature, _estimated_tokens)) => {
+                        info!("Placed PumpFun buy with Signature: {}", buy_signature);
+                        // The sell uses the real on-chain balance, not the buy estimate.
+                        pending.push(FutureSell {
+                            mint: parsed_txn.mint,
+                            creator: parsed_txn.creator,
+                            slot_to_exec: curr_slot + config.sell_delay_slots,
+                        });
+                    }
+                    Err(e) => error!("Failed to place PumpFun buy: {}", e),
                 }
+
+                let curr_time = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or_default();
+                info!("Executed TX at: {}", curr_time);
+
+                // One snipe per transaction is enough.
+                break;
             }
         }
-    });
-
-    // gRPC thread
-    // let balance_cache_clone = balance_cache.clone();
-    // tokio::spawn({
-    //     async move {
-    //         let manager = GrpcStreamManager::new(
-    //             "https://basic.grpc.solanavibestation.com/",
-    //             "REMOVED_SECRET",
-    //             balance_cache_clone,
-    //             "https://api.mainnet-beta.solana.com".to_string(),
-    //         )
-    //         .await
-    //         .unwrap();
-    //         let mut manager_lock = manager.lock().await;
-
-    //         info!("Starting subscription for account balance updates...");
-
-    //         let result = manager_lock.connect(pool_accounts, receiver).await;
-    //         if let Err(e) = &result {
-    //             error!("Subscription error: {:?}", e);
-    //         }
-
-    //         result.unwrap();
-    //     }
-    // });
-
-    // Keep the main thread running
-    loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
     }
+
+    Ok(())
+}
+
+enum SellOutcome {
+    Sold(String),
+    NothingToSell,
+}
+
+async fn try_sell(sdk: &PumpFunSDK, payer: &Keypair, position: &FutureSell) -> Result<SellOutcome> {
+    let balance = sdk.token_balance(&payer.pubkey(), &position.mint).await?;
+    if balance == 0 {
+        return Ok(SellOutcome::NothingToSell);
+    }
+
+    // A fresh blockhash: the one from the create tx may be expired by now.
+    let blockhash = sdk.latest_blockhash().await?;
+    let signature = sdk
+        .clone()
+        .sell(
+            &position.mint,
+            balance,
+            payer.insecure_clone(),
+            blockhash,
+            position.creator,
+        )
+        .await?;
+
+    Ok(SellOutcome::Sold(signature))
+}
+
+/// Sells a position with retries. Skips the sell when there is nothing to sell, which
+/// happens when the buy never landed.
+async fn sell_position(sdk: PumpFunSDK, payer: Keypair, position: FutureSell) {
+    for attempt in 1..=MAX_SELL_ATTEMPTS {
+        match try_sell(&sdk, &payer, &position).await {
+            Ok(SellOutcome::Sold(signature)) => {
+                info!(
+                    "Placed PumpFun sell for {} with Signature: {}",
+                    position.mint, signature
+                );
+                return;
+            }
+            Ok(SellOutcome::NothingToSell) => warn!(
+                "No {} balance to sell yet (attempt {}/{})",
+                position.mint, attempt, MAX_SELL_ATTEMPTS
+            ),
+            Err(e) => error!(
+                "Sell of {} failed (attempt {}/{}): {:#}",
+                position.mint, attempt, MAX_SELL_ATTEMPTS, e
+            ),
+        }
+
+        if attempt < MAX_SELL_ATTEMPTS {
+            tokio::time::sleep(SELL_RETRY_DELAY).await;
+        }
+    }
+
+    error!(
+        "Giving up selling {}: either the buy never landed or the sell kept failing. Check the wallet.",
+        position.mint
+    );
 }
