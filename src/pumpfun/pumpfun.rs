@@ -18,12 +18,14 @@ use std::{str::FromStr, sync::Arc};
 
 use rustls::crypto::{ring::default_provider, CryptoProvider};
 
+use crate::types::sol_to_lamports;
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_sdk::{
-    compute_budget::ComputeBudgetInstruction, message::v0::Message as MessageV0,
-    native_token::sol_to_lamports, pubkey::Pubkey, signature::Keypair, system_instruction,
+    message::v0::Message as MessageV0, pubkey::Pubkey, signature::Keypair,
     transaction::VersionedTransaction,
 };
+use solana_system_interface::instruction as system_instruction;
 use spl_associated_token_account::get_associated_token_address;
 
 use solana_sdk::hash::Hash;
@@ -230,7 +232,7 @@ impl PumpFunSDK {
         let zeroblock_fee =
             system_instruction::transfer(&user, &ZEROBLOCK_FEE, sol_to_lamports(0.0001));
 
-        let close_ata = spl_token_2022::instruction::close_account(
+        let close_ata = spl_token::instruction::close_account(
             &PUMPFUN_TOKEN_PROGRAM,
             &user_ata,
             &user,

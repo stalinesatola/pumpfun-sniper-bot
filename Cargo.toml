@@ -22,12 +22,15 @@ anyhow = "1.0"
 
 thiserror = "1.0.38"
 
-# Solana ecosystem - all pinned to 2.2.1
-solana-sdk = "=2.2.1"
-solana-client = "=2.2.1"
-spl-associated-token-account = "=6.0.0"
-spl-token-2022 = "8.0.1"
-solana-entry = "=2.2.1"
+# Solana ecosystem
+solana-sdk = "3"
+solana-client = "3"
+spl-associated-token-account = "8"
+solana-entry = "3"
+solana-system-interface = { version = "3", features = ["bincode"] }
+solana-compute-budget-interface = "3"
+solana-commitment-config = "3"
+spl-token = "9"
 
 # TLS
 rustls = { version = "0.23.23", features = ["ring"] }

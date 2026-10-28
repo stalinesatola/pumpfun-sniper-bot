@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      # The toolchain (1.85.1 + rustfmt + clippy) comes from rust-toolchain.toml.
+      # The toolchain (1.89.0 + rustfmt + clippy) comes from rust-toolchain.toml.
       - uses: actions/cache@v4
         with:
           path: |
@@ -54,8 +54,8 @@ jobs:
       - run: npm ci
       - run: npm run build
 
-  # Informational: most remaining advisories come from the pinned Solana 2.2.1 SDK and
-  # cannot be fixed without migrating it, so this reports but does not block merges.
+  # Informational: most remaining advisories come from the Solana SDK dependency tree and
+  # are fixed upstream, so this reports but does not block merges.
   audit:
     runs-on: ubuntu-latest
     continue-on-error: true

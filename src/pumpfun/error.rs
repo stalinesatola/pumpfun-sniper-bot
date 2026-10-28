@@ -7,7 +7,7 @@ pub enum PumpFunError {
     SolanaClientError(#[from] solana_client::client_error::ClientError),
 
     #[error("SPL token error: {0}")]
-    SplTokenError(#[from] spl_token_2022::error::TokenError),
+    SplTokenError(#[from] spl_token::error::TokenError),
 
     #[error("Pubkey parsing error: {0}")]
     PubkeyParseError(String),

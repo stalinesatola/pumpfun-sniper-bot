@@ -7,10 +7,13 @@ updates:
     groups:
       rust-minor-patch:
         update-types: [minor, patch]
-    # The Solana SDK is pinned (=2.2.1) on purpose; upgrade it as a deliberate migration.
+    # Solana/SPL majors change APIs and wire-adjacent types; upgrade them deliberately
+    # (tests/golden_tx.rs must stay green).
     ignore:
       - dependency-name: "solana-*"
+        update-types: ["version-update:semver-major"]
       - dependency-name: "spl-*"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: npm
     directory: /ui
     schedule:

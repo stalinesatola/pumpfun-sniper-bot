@@ -19,7 +19,7 @@ use shred_pool_cache::state::{AppState, Settings};
 use shred_pool_cache::trader::Trader;
 use shred_pool_cache::types::*;
 use solana_client::rpc_client::SerializableTransaction;
-use solana_sdk::instruction::CompiledInstruction;
+use solana_sdk::message::compiled_instruction::CompiledInstruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::Signer;
 
@@ -177,6 +177,8 @@ fn is_create_ix(account_keys: &[Pubkey], ix: &CompiledInstruction) -> bool {
 }
 
 /// Connects to the Shredstream proxy and processes slots until the stream ends or fails.
+// `Entry` is flagged as unstable Agave API in newer releases; tests/golden_tx.rs pins its wire format.
+#[allow(deprecated)]
 async fn run_stream(config: &Config, trader: &Trader) -> Result<()> {
     let state = &trader.state;
     info!(

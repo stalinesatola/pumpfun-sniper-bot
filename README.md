@@ -4,8 +4,8 @@
 
 **Contact / custom builds:** [t.me/dexoryn](https://t.me/dexoryn)
 
-[![Solana](https://img.shields.io/badge/Solana-2.2.1-14F195?logo=solana&logoColor=white)](https://solana.com)
-[![Rust](https://img.shields.io/badge/Rust-1.85.1-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Solana](https://img.shields.io/badge/Solana-3.x-14F195?logo=solana&logoColor=white)](https://solana.com)
+[![Rust](https://img.shields.io/badge/Rust-1.89.0-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Pump.fun](https://img.shields.io/badge/Pump.fun-Sniper-00FF88)](https://pump.fun)
 [![Jito](https://img.shields.io/badge/Jito-Shredstream-FF6B00)](https://www.jito.wtf)
 [![Telegram](https://img.shields.io/badge/Telegram-dexoryn-26A5E4?logo=telegram&logoColor=white)](https://t.me/dexoryn)
@@ -28,14 +28,14 @@ If you need a **private sniper**, copy-trade, or a custom shredstream cluster (C
 - **Dashboard** — web panel and terminal UI with live settings
 - **Pump.fun SDK** — buy / sell instruction builder + versioned transactions
 - **PumpSwap SDK** — AMM pool math, slippage, buy/sell execution
-- **Pinned stack** — Rust 1.85.1, Solana SDK 2.2.1, thin LTO release builds
+- **Pinned stack** — Rust 1.89.0, Solana SDK 3.x, thin LTO release builds
 
 ## Stack
 
 | Layer | Tech |
 | --- | --- |
-| Language | Rust 1.85.1 (`rustfmt` + `clippy`) |
-| Chain | Solana 2.2.1 |
+| Language | Rust 1.89.0 (`rustfmt` + `clippy`) |
+| Chain | Solana 3.x |
 | Ingest | Jito Shredstream gRPC |
 | Venues | Pump.fun · PumpSwap (SDK, not used by the sniper loop) |
 | Landing | Astralane endpoint + tip |
@@ -63,7 +63,7 @@ Shredstream proxy  →  deserialize entries  →  scan Pump.fun program
 
 ## Requirements
 
-- Rust **1.85.1** (see `rust-toolchain.toml`)
+- Rust **1.89.0** (see `rust-toolchain.toml`)
 - A funded Solana wallet
 - Shredstream endpoint (not public RPC)
 - An Astralane endpoint (or compatible) to send transactions through

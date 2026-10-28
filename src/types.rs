@@ -1,8 +1,13 @@
 use solana_sdk::hash::Hash;
-use solana_sdk::instruction::CompiledInstruction;
+use solana_sdk::message::compiled_instruction::CompiledInstruction;
 use solana_sdk::pubkey;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::transaction::VersionedTransaction;
+
+/// SOL to lamports, rounded to the nearest lamport.
+pub fn sol_to_lamports(sol: f64) -> u64 {
+    (sol * 1_000_000_000.0).round() as u64
+}
 
 pub const PUMP_AMM_PROGRAM_ID_STR: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 pub const PUMP_FUN_PROGRAM_ID_STR: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
