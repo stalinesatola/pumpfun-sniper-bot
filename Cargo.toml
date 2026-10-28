@@ -7,7 +7,15 @@ edition = "2021"
 # thin has minimal overhead vs none (default): https://blog.llvm.org/2016/06/thinlto-scalable-and-incremental-lto.html
 lto = "thin"
 
+[features]
+default = ["tui"]
+# Terminal dashboard (`--tui`).
+tui = ["dep:ratatui"]
+
 [dependencies]
+axum = { version = "0.8.1", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs"] }
+ratatui = { version = "0.29", optional = true }
 moka = { version = "0.12.10", features = ["sync"] }
 
 tokio = { version = "1.0", features = ["full"] }
@@ -74,3 +82,6 @@ rand = "0.9.1"
 # compile against OpenSSL 4. Pin versions that support 4.0.2.
 openssl-sys = "0.9.114"
 openssl = "0.10.78"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

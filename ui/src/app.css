@@ -1,0 +1,20 @@
+@import 'tailwindcss';
+
+/* Everything visual hangs off these tokens: change them here and the whole panel follows. */
+@theme {
+  --color-bg: #0b0e14;
+  --color-panel: #121722;
+  --color-line: #1f2733;
+  --color-ink: #d7dde8;
+  --color-dim: #7b8798;
+  --color-good: #3ddc97;
+  --color-bad: #ff5c6c;
+  --color-warn: #f5b942;
+  --color-accent: #5eb0ff;
+  --font-sans: ui-sans-serif, system-ui, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+}
+
+html, body { background: var(--color-bg); color: var(--color-ink); font-family: var(--font-sans); }
+.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.u-legend { display: none; }

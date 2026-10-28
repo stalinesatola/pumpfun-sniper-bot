@@ -66,7 +66,8 @@ pub struct PumpFunSellType {
 impl PumpFunSDK {
     pub async fn new(rpc_url: &str, astralane_url: &str, priority_fee: PriorityFeePump) -> Self {
         if CryptoProvider::get_default().is_none() {
-            default_provider().install_default().unwrap();
+            // Another thread may install a provider between the check and here; that is fine.
+            let _ = default_provider().install_default();
         }
         let client = Arc::new(RpcClient::new(String::from(rpc_url)));
         let astralane_client = Arc::new(RpcClient::new(astralane_url.to_string()));

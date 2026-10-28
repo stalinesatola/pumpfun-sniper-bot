@@ -35,7 +35,7 @@ where
     }
 }
 
-fn positive_sol(name: &str, value: f64) -> Result<f64> {
+pub fn positive_sol(name: &str, value: f64) -> Result<f64> {
     if value.is_finite() && value > 0.0 {
         Ok(value)
     } else {

@@ -107,10 +107,42 @@ cargo run --release
 
 Use `--release`. Debug builds are too slow for slot-race sniping.
 
+## Dashboard (web and terminal)
+
+Two front ends share one live state, so they always agree: a **web panel** and a **terminal UI**. The trading loop only publishes events; it never waits for either, so a slow browser cannot delay a buy.
+
+**Web panel**
+
+```bash
+cd ui && npm install && npm run build   # once, and after changing the UI
+cargo run --release                     # then open http://127.0.0.1:8787
+```
+
+Log in with `API_TOKEN` (or the token printed in the log if you left it unset). It shows slot, stream status and wallet balance, a balance chart, positions with *Sell now* / *Retry sell*, and a live event feed. You can pause the bot and change buy amount, tip and sell delay without restarting; changes apply from the next buy and are bounded (buy at most 10 SOL, tip at most 0.1 SOL).
+
+The API listens on `127.0.0.1` only and every call needs the token. Your wallet key never goes through it. To reach it from another machine use an SSH tunnel (`ssh -L 8787:127.0.0.1:8787 host`) instead of binding to a public address.
+
+Customising the look: colours and fonts are tokens at the top of `ui/src/app.css`; layout is in `ui/src/App.svelte`. `npm run dev` serves it with hot reload and proxies to the running bot.
+
+**Terminal UI**
+
+```bash
+cargo run --release -- --tui
+```
+
+Keys: `↑/↓` select, `s` sell the selected position, `p` pause/resume, `q` quit. Logs go to `sniper.log` while the TUI is open. Build without it using `--no-default-features`.
+
+**Try it without a wallet:** `cargo run --example demo` (add `-- --tui`) runs both interfaces on simulated activity.
+
 ## Repository layout
 
 ```text
 src/main.rs              Pump.fun create sniper entrypoint
+src/state.rs             Shared live state, events and runtime settings
+src/trader.rs            Sell execution with retries
+src/api.rs               Dashboard API (REST + WebSocket) and static UI
+src/tui.rs               Terminal dashboard (ratatui)
+ui/                      Web dashboard (Svelte + Tailwind + uPlot)
 src/copy.rs              Copy-trade shredstream listener
 src/grpc.rs              Yellowstone gRPC balance streams
 src/types.rs             Shared buy/sell amounts and tx parsers
