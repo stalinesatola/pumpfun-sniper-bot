@@ -266,7 +266,7 @@ mod rpc_utils {
                         error!(
                             "slot_subscribe_error errors {} error str {}",
                             slot_subscribe_errors,
-                            e.to_string(),
+                            e,
                         );
                     }
                 },
@@ -275,7 +275,7 @@ mod rpc_utils {
                     error!(
                         "slot_subscribe_pubsub_connect_error errors {} error str {}",
                         connect_errors,
-                        e.to_string(),
+                        e,
                     );
                 }
             }

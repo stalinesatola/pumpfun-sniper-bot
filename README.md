@@ -27,9 +27,9 @@ If you need a **private sniper**, copy-trade, or a custom shredstream cluster (C
 - **Pump.fun SDK** — buy / sell instruction builder + versioned transactions
 - **PumpSwap SDK** — AMM pool math, slippage, buy/sell execution
 - **Orca Whirlpool** — state decode, tick arrays, Raydium / Kamino helpers
-- **Jito searcher + SWQoS** — protobuf crate, bundle client, tip accounts
-- **Yellowstone gRPC** — token-balance stream manager
-- **Copy-trade listener** — follow wallets off the same shredstream pipe
+- **Jito searcher + SWQoS** — protobuf crate, bundle client, tip accounts (compiled but not used: transactions are sent through the Astralane endpoint)
+- **Yellowstone gRPC** — token-balance stream manager (`src/grpc.rs`, not part of the build)
+- **Copy-trade listener** — follow wallets off the same shredstream pipe (`src/copy.rs`, not part of the build)
 - **Pinned stack** — Rust 1.85.1, Solana SDK 2.2.1, thin LTO release builds
 
 ## Stack

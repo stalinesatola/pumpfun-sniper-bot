@@ -1,5 +1,4 @@
 use cluster_data_impl::ClusterDataImpl;
-use jito_protos::searcher::searcher_service_client::SearcherServiceClient;
 use searcher_client::{get_searcher_client_auth, SearcherClient};
 use solana_sdk::signature::Keypair;
 
@@ -7,7 +6,7 @@ use std::sync::{atomic::AtomicBool, Arc};
 use tokio::sync::{Mutex, RwLock};
 use tonic::transport::Channel;
 
-use solana_sdk::{pubkey::Pubkey, signature::Signature};
+use solana_sdk::signature::Signature;
 
 use anyhow::{anyhow, Result};
 use rand::{rng, seq::IteratorRandom};
@@ -64,7 +63,7 @@ impl FeeClientTrait for JitoClient {
         &self,
         transaction: &VersionedTransaction,
     ) -> Result<Signature, anyhow::Error> {
-        self.send_transaction(&transaction).await
+        self.send_transaction(transaction).await
     }
 
     async fn get_tip_account(&self) -> Result<String, anyhow::Error> {
@@ -103,6 +102,6 @@ impl JitoClient {
         &self,
         transactions: &Vec<VersionedTransaction>,
     ) -> Result<String, anyhow::Error> {
-        searcher_client::send_bundle_no_wait(&transactions, self.searcher_client.clone()).await
+        searcher_client::send_bundle_no_wait(transactions, self.searcher_client.clone()).await
     }
 }

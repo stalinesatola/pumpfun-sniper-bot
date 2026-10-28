@@ -111,12 +111,12 @@ impl ClientInterceptor {
         let mut access_token_expiration = access_token_expiration;
 
         loop {
-            let access_token_ttl = SystemTime::try_from(access_token_expiration.clone())
+            let access_token_ttl = SystemTime::try_from(access_token_expiration)
                 .unwrap()
                 .duration_since(SystemTime::now())
                 .unwrap_or_else(|_| Duration::from_secs(0));
             let refresh_token_ttl =
-                SystemTime::try_from(refresh_token.expires_at_utc.as_ref().unwrap().clone())
+                SystemTime::try_from(*refresh_token.expires_at_utc.as_ref().unwrap())
                     .unwrap()
                     .duration_since(SystemTime::now())
                     .unwrap_or_else(|_| Duration::from_secs(0));

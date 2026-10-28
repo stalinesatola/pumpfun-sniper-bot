@@ -25,9 +25,7 @@ use solana_sdk::{
     native_token::sol_to_lamports, pubkey::Pubkey, signature::Keypair, system_instruction,
     transaction::VersionedTransaction,
 };
-use spl_associated_token_account::{
-    get_associated_token_address, instruction::create_associated_token_account_idempotent,
-};
+use spl_associated_token_account::get_associated_token_address;
 
 use solana_sdk::hash::Hash;
 

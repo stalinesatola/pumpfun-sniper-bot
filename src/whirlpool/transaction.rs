@@ -42,8 +42,7 @@ pub async fn build_and_send_transaction(
 ) -> anyhow::Result<Vec<Signature>> {
     let enable_kamino = config
         .kamino_flashloan
-        .as_ref()
-        .map_or(false, |k| k.enabled);
+        .as_ref().is_some_and(|k| k.enabled);
     let compute_unit_limit = config.bot.compute_unit_limit
         + if enable_kamino {
             KAMINO_ADDITIONAL_COMPUTE_UNITS

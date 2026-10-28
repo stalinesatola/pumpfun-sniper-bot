@@ -9,16 +9,16 @@ use jito_protos::{
 use solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool};
 use std::{
     sync::{atomic::AtomicBool, Arc},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use bincode::serialize;
 
 use jito_protos::bundle::BundleResult;
 
-use solana_client::nonblocking::{rpc_client::RpcClient, tpu_client::TpuClient};
+use solana_client::nonblocking::tpu_client::TpuClient;
 use solana_sdk::{
-    signature::{Keypair, Signature},
+    signature::Keypair,
     transaction::VersionedTransaction,
 };
 use thiserror::Error;
@@ -34,7 +34,6 @@ use super::{
     cluster_data_impl::{ClusterData, ClusterDataImpl},
 };
 use crate::swqos::client_interceptor::*;
-use crate::swqos::common::poll_transaction_confirmation;
 use bytes::Bytes;
 use tonic::codegen::{Body, StdError};
 
@@ -78,18 +77,12 @@ pub struct SearcherClient<C: ClusterData, T> {
 }
 
 use jito_protos::packet::{
-    Meta as ProtoMeta, Packet as ProtoPacket, PacketBatch as ProtoPacketBatch,
-    PacketFlags as ProtoPacketFlags,
+    Meta as ProtoMeta, Packet as ProtoPacket,
 };
 
-use std::{
-    cmp::min,
-    net::{AddrParseError, IpAddr, Ipv4Addr, SocketAddr},
-    str::FromStr,
-};
+use std::cmp::min;
 
-use solana_perf::packet::{Packet, PacketBatch, PACKET_DATA_SIZE};
-use solana_sdk::packet::{Meta, PacketFlags};
+use solana_perf::packet::{Packet, PACKET_DATA_SIZE};
 
 pub fn packet_from_versioned_tx(tx: VersionedTransaction) -> Packet {
     let tx_data = serialize(&tx).expect("serializes");
