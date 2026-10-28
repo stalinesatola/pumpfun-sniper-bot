@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.89.0-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Pump.fun](https://img.shields.io/badge/Pump.fun-Sniper-00FF88)](https://pump.fun)
 [![Jito](https://img.shields.io/badge/Jito-Shredstream-FF6B00)](https://www.jito.wtf)
-[![Telegram](https://img.shields.io/badge/Telegram-dexoryn-26A5E4?logo=telegram&logoColor=white)](https://t.me/bondsbtc)
+[![Telegram](https://img.shields.io/badge/Telegram-bondsbtc-26A5E4?logo=telegram&logoColor=white)](https://t.me/bondsbtc)
 
 ---
 
@@ -32,7 +32,6 @@ Most public “Pump.fun snipers” wait on RPC logs or Helius webhooks. That is 
 
 This bot ingests **Jito Shredstream entries** over gRPC, deserializes shreds, and matches Pump.fun `create` instruction discriminators before the market is crowded. Buys go out with compute-budget + tip accounts (Astralane / Jito-style bribes). A sell is cached and fired a few slots later.
 
-If you need a **private sniper**, copy-trade, or a custom shredstream cluster (Cherry / Teraswitch / Latitude), message **[t.me/dexoryn](https://t.me/dexoryn)**.
 
 ## Features
 
