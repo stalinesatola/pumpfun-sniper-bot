@@ -4,6 +4,7 @@
 
 [![Solana](https://img.shields.io/badge/Solana-3.x-14F195?logo=solana&logoColor=white)](https://solana.com)
 [![Rust](https://img.shields.io/badge/Rust-1.89.0-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Pump.fun](https://img.shields.io/badge/Pump.fun-Sniper-00FF88)](https://pump.fun)
 [![Jito](https://img.shields.io/badge/Jito-Shredstream-FF6B00)](https://www.jito.wtf)
 [![Telegram](https://img.shields.io/badge/Telegram-bondsbtc-26A5E4?logo=telegram&logoColor=white)](https://t.me/bondsbtc)
@@ -213,6 +214,10 @@ This project started as [dexoryn](https://github.com/dexoryn)'s sniper; the cred
 
 **What is and is not verified:** the unit, API, terminal-UI and golden tests pass, and the dashboards were exercised in a real browser and terminal against the demo. The bot itself has **not** been run against live Shredstream, RPC or on-chain orders by these changes — try it with a tiny `SOL_BUY_AMOUNT` first.
 
+
+## License
+
+[MIT](LICENSE).
 
 ## Disclaimer
 
