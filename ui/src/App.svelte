@@ -50,13 +50,14 @@
   const eventStyle = {
     buy_sent: 'text-good', sell_sent: 'text-good', buy_failed: 'text-bad', sell_failed: 'text-bad',
     sell_started: 'text-warn', paused: 'text-warn', stream: 'text-warn', settings_changed: 'text-accent',
-    create_detected: 'text-dim', balance: 'text-dim', skipped: 'text-dim',
+    create_detected: 'text-dim', balance: 'text-dim', skipped: 'text-dim', copy_signal: 'text-accent',
   };
 
   function describe(e) {
     switch (e.type) {
       case 'create_detected': return `create ${short(e.mint)} @ ${e.slot}`;
       case 'buy_sent': return `buy ${short(e.mint)} ${e.sol} SOL, sell at ${e.sell_at_slot}`;
+      case 'copy_signal': return `leader ${short(e.leader)} ${e.side === 'buy' ? 'bought' : 'sold'} ${short(e.mint)} (${e.sol.toFixed(3)} SOL)`;
       case 'skipped': return `skipped ${short(e.mint)}: ${e.reason}`;
       case 'buy_failed': return `buy failed ${short(e.mint)}: ${e.error}`;
       case 'sell_started': return `selling ${short(e.mint)}`;
@@ -162,18 +163,37 @@
           <div><dt class="font-sans text-dim">{label}</dt><dd>{value}</dd></div>
         {/each}
       </dl>
+      <h2 class="mb-2 mt-4 font-medium text-dim">
+        Copy-trade {snap.copy.enabled ? '' : '(off: set COPY_WALLETS in .env)'}
+      </h2>
+      {#if snap.copy.enabled}
+        <dl class="num grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3 lg:grid-cols-5">
+          {#each [
+            ['followed wallets', snap.copy.wallets],
+            ['buy per copy', `${snap.copy.buy_sol} SOL`],
+            ['leader size range', `${snap.copy.min_leader_sol}..${snap.copy.max_leader_sol} SOL`],
+            ['sell with leader', snap.copy.sell_with_leader ? 'yes' : 'no'],
+            ['max hold', `${snap.copy.max_hold_slots} slots`],
+          ] as [label, value]}
+            <div><dt class="font-sans text-dim">{label}</dt><dd>{value}</dd></div>
+          {/each}
+        </dl>
+      {/if}
     </section>
 
     <section class="overflow-x-auto rounded-lg border border-line bg-panel">
       <h2 class="px-4 pt-4 text-sm font-medium text-dim">Positions</h2>
       <table class="w-full text-left text-sm">
         <thead class="text-dim">
-          <tr><th class="px-4 py-2">Mint</th><th>Status</th><th>SOL</th><th>Slots left</th><th>Opened</th><th>Note</th><th></th></tr>
+          <tr><th class="px-4 py-2">Mint</th><th>Source</th><th>Status</th><th>SOL</th><th>Slots left</th><th>Opened</th><th>Note</th><th></th></tr>
         </thead>
         <tbody>
           {#each positions as p (p.mint)}
             <tr class="border-t border-line">
               <td class="num px-4 py-2"><a class="hover:text-accent" href={solscan('token', p.mint)} target="_blank" rel="noreferrer">{short(p.mint)}</a></td>
+              <td class={p.source?.kind === 'copy' ? 'text-accent' : 'text-dim'} title={p.source?.leader ?? ''}>
+                {p.source?.kind === 'copy' ? `copy ${short(p.source.leader)}` : 'snipe'}
+              </td>
               <td class={statusStyle[p.status]}>{p.status}</td>
               <td class="num">{p.sol}</td>
               <td class="num">{p.status === 'held' ? Math.max(0, p.sell_at_slot - snap.slot) : '-'}</td>
@@ -188,7 +208,7 @@
               </td>
             </tr>
           {:else}
-            <tr><td class="px-4 py-6 text-dim" colspan="7">No positions yet.</td></tr>
+            <tr><td class="px-4 py-6 text-dim" colspan="8">No positions yet.</td></tr>
           {/each}
         </tbody>
       </table>

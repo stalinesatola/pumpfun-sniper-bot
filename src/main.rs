@@ -12,6 +12,7 @@ use rustls::crypto::aws_lc_rs::default_provider;
 use rustls::crypto::CryptoProvider;
 use shred_pool_cache::api::{self, ApiConfig};
 use shred_pool_cache::config::Config;
+use shred_pool_cache::copy::{self, CopyConfig};
 use shred_pool_cache::pumpfun::PumpFunSDK;
 use shred_pool_cache::pumpswap::constants::PriorityFeePump;
 use shred_pool_cache::risk::{lamports_to_sol, Candidate, RiskConfig};
@@ -65,6 +66,20 @@ async fn main() -> Result<()> {
     let config = Config::from_env().context("invalid configuration (check your .env)")?;
     let api_config = ApiConfig::from_env().context("invalid API configuration")?;
     let risk = RiskConfig::from_env().context("invalid risk configuration")?;
+    let copy_config =
+        CopyConfig::from_env(config.buy_amount_sol).context("invalid copy-trade configuration")?;
+    if copy_config.wallets.contains(&config.payer.pubkey()) {
+        anyhow::bail!("COPY_WALLETS contains this bot's own wallet; it would copy itself");
+    }
+    if copy_config.enabled() {
+        info!(
+            "Copy-trade: following {} wallet(s), {} SOL per copy, sell with leader: {}, max hold {} slots",
+            copy_config.wallets.len(),
+            copy_config.buy_sol,
+            copy_config.sell_with_leader,
+            copy_config.max_hold_slots
+        );
+    }
     info!(
         "Risk: max {} open, spend cap {} SOL, drawdown cap {} SOL, slippage {}%, dev buy {}..{} SOL, {} blocked creators, {} blocked keywords (0 = off)",
         risk.max_open_positions,
@@ -213,6 +228,23 @@ async fn run_stream(config: &Config, trader: &Trader) -> Result<()> {
         for entry in &entries {
             for tx in &entry.transactions {
                 let account_keys = tx.message.static_account_keys();
+
+                // Copy-trade: mirror what the followed wallets do on Pump.fun.
+                if state.copy.enabled() {
+                    if let Some(trade) = copy::leader_trade(
+                        account_keys,
+                        tx.message.instructions(),
+                        &state.copy.wallets,
+                    ) {
+                        copy::handle_leader_trade(
+                            trader,
+                            trade,
+                            curr_slot,
+                            *tx.message.recent_blockhash(),
+                        );
+                    }
+                }
+
                 let Some(create_ix) = tx
                     .message
                     .instructions()
@@ -272,6 +304,12 @@ async fn run_stream(config: &Config, trader: &Trader) -> Result<()> {
                     continue;
                 }
 
+                // Another signal (a followed wallet buying the same token) may already own it.
+                if !state.claim_mint(&parsed_txn.mint, buy_amount_sol) {
+                    state.record_skipped(&parsed_txn.mint, "already holding or buying this token");
+                    continue;
+                }
+
                 let mut sdk = trader.sdk.clone();
                 sdk.priority_fee.jito_tip_fee = tip_sol;
 
@@ -309,6 +347,7 @@ async fn run_stream(config: &Config, trader: &Trader) -> Result<()> {
                         state.record_buy_failed(&parsed_txn.mint, &e.to_string());
                     }
                 }
+                state.release_mint(&parsed_txn.mint);
 
                 // One snipe per transaction is enough.
                 break;

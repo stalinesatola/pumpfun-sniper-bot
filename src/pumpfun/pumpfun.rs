@@ -33,6 +33,17 @@ use solana_sdk::hash::Hash;
 const ASTRALANE_TIP: Pubkey = pubkey!("astra4uejePWneqNaJKuFFA8oonqCE1sqF6b45kDMZm");
 const ZEROBLOCK_FEE: Pubkey = pubkey!("7mMzAuqiZemFTrQoquVvJqv53Xb1L4pN38D1A5T2iMEZ");
 
+/// Raw token units that `sol_lamports` buys at the price implied by `reference` (a buy
+/// instruction's token amount and SOL cap). `None` if the reference has a zero amount.
+pub fn tokens_for_sol(sol_lamports: u64, reference: &BuyAmounts) -> Option<u64> {
+    if reference.base_amount_out == 0 || reference.max_quote_amount_in == 0 {
+        return None;
+    }
+    let tokens = sol_lamports as u128 * reference.base_amount_out as u128
+        / reference.max_quote_amount_in as u128;
+    u64::try_from(tokens).ok()
+}
+
 #[derive(Clone)]
 pub struct PumpFunSDK {
     pub client: Arc<RpcClient>,
@@ -90,11 +101,15 @@ impl PumpFunSDK {
         let sol_to_buy_lamports = sol_to_lamports(params.sol_to_buy);
         let user_pubkey = params.user_keypair.pubkey();
 
+        // Same price as the observed buy (its SOL cap over its token amount), so we ask for
+        // the tokens our SOL buys at that price.
+        let bought_token_amount = tokens_for_sol(sol_to_buy_lamports, &params.buy_amounts)
+            .ok_or_else(|| {
+                PumpFunError::TransactionError("reference buy has a zero amount".to_string())
+            })?;
         let price: f64 = (params.buy_amounts.max_quote_amount_in as f64 / 1_000_000_000.0)
             / (params.buy_amounts.base_amount_out as f64 / 1_000_000.0);
 
-        let bought_token_amount =
-            (sol_to_buy_lamports as f64 * (price * 1_000_000.0) * 1_000_000.0) as u64;
         let sol_to_buy_after_slippage =
             calculate_with_slippage_buy(sol_to_buy_lamports, params.slippage);
 
@@ -358,5 +373,47 @@ impl PumpFunSDK {
         };
 
         Ok((order_placement_res, tx.1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn amounts(tokens: u64, sol: u64) -> BuyAmounts {
+        BuyAmounts {
+            base_amount_out: tokens,
+            max_quote_amount_in: sol,
+        }
+    }
+
+    #[test]
+    fn tokens_scale_with_our_sol_at_the_reference_price() {
+        // Reference: 35,000,000 tokens (6 decimals) for 1 SOL.
+        let reference = amounts(35_000_000_000_000, 1_000_000_000);
+        // 0.01 SOL buys 1/100 of that, whatever the price level.
+        assert_eq!(
+            tokens_for_sol(10_000_000, &reference),
+            Some(350_000_000_000)
+        );
+        // Twice the price (half the tokens per SOL) => half the tokens.
+        let pricier = amounts(17_500_000_000_000, 1_000_000_000);
+        assert_eq!(tokens_for_sol(10_000_000, &pricier), Some(175_000_000_000));
+        // Spending what the reference spent returns the reference amount.
+        assert_eq!(
+            tokens_for_sol(1_000_000_000, &reference),
+            Some(35_000_000_000_000)
+        );
+    }
+
+    #[test]
+    fn zero_or_huge_references_are_rejected_not_divided() {
+        assert_eq!(tokens_for_sol(1, &amounts(0, 5)), None);
+        assert_eq!(tokens_for_sol(1, &amounts(5, 0)), None);
+        assert_eq!(
+            tokens_for_sol(u64::MAX, &amounts(u64::MAX, 1)),
+            None,
+            "overflow"
+        );
     }
 }

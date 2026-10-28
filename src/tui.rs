@@ -11,7 +11,8 @@ use ratatui::Frame;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
-use crate::state::{AppState, Event, PositionStatus, Snapshot, Stamped};
+use crate::copy::Side;
+use crate::state::{AppState, Event, PositionSource, PositionStatus, Snapshot, Stamped};
 use crate::trader::Trader;
 
 /// Redraw (and key poll) period.
@@ -54,6 +55,21 @@ fn describe(e: &Stamped) -> (Color, String) {
             Color::Green,
             format!(
                 "buy       {} {sol} SOL, sell at {sell_at_slot}",
+                short(mint)
+            ),
+        ),
+        Event::CopySignal {
+            leader,
+            mint,
+            side,
+            sol,
+            ..
+        } => (
+            Color::Cyan,
+            format!(
+                "leader    {} {} {} {sol:.3} SOL",
+                short(leader),
+                if *side == Side::Buy { "bought" } else { "sold" },
                 short(mint)
             ),
         ),
@@ -169,6 +185,10 @@ fn draw(f: &mut Frame, snap: &Snapshot, table: &mut TableState) {
         };
         Row::new(vec![
             Cell::from(short(&p.mint)),
+            Cell::from(match p.source {
+                PositionSource::Snipe => "snipe",
+                PositionSource::Copy { .. } => "copy",
+            }),
             Cell::from(label).style(Style::new().fg(color)),
             Cell::from(format!("{}", p.sol)),
             Cell::from(if p.status == PositionStatus::Held {
@@ -184,6 +204,7 @@ fn draw(f: &mut Frame, snap: &Snapshot, table: &mut TableState) {
             rows,
             [
                 Constraint::Length(13),
+                Constraint::Length(6),
                 Constraint::Length(9),
                 Constraint::Length(8),
                 Constraint::Length(10),
@@ -191,7 +212,7 @@ fn draw(f: &mut Frame, snap: &Snapshot, table: &mut TableState) {
             ],
         )
         .header(
-            Row::new(["mint", "status", "SOL", "slots left", "note"])
+            Row::new(["mint", "src", "status", "SOL", "slots left", "note"])
                 .style(Style::new().add_modifier(Modifier::BOLD)),
         )
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))

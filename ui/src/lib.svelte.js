@@ -74,7 +74,7 @@ function applyEvent(e) {
     case 'buy_sent':
       s.session_spent_sol += e.sol;
       s.positions.push({
-        mint: e.mint, status: 'held', opened_ms: e.ts_ms, sol: e.sol,
+        mint: e.mint, source: e.source, status: 'held', opened_ms: e.ts_ms, sol: e.sol,
         sell_at_slot: e.sell_at_slot, buy_signature: e.signature, sell_signature: null, error: null,
       });
       break;

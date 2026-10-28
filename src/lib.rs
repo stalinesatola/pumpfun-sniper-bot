@@ -1,5 +1,6 @@
 pub mod api;
 pub mod config;
+pub mod copy;
 pub mod pumpfun;
 pub mod pumpswap;
 pub mod risk;

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -8,6 +8,7 @@ use solana_sdk::pubkey::Pubkey;
 use tokio::sync::broadcast;
 
 use crate::config::{positive_sol, Config};
+use crate::copy::{CopyConfig, CopyView, LeaderTrade, Side};
 use crate::risk::{lamports_to_sol, Exposure, RiskConfig, RiskView};
 
 const MAX_RECENT_EVENTS: usize = 200;
@@ -57,6 +58,7 @@ pub enum Event {
         signature: String,
         sol: f64,
         sell_at_slot: u64,
+        source: PositionSource,
     },
     BuyFailed {
         mint: String,
@@ -65,6 +67,13 @@ pub enum Event {
     Skipped {
         mint: String,
         reason: String,
+    },
+    CopySignal {
+        leader: String,
+        mint: String,
+        side: Side,
+        sol: f64,
+        slot: u64,
     },
     SellStarted {
         mint: String,
@@ -110,6 +119,16 @@ pub enum PositionStatus {
     Failed,
 }
 
+/// Why we hold a position.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PositionSource {
+    /// Bought at token creation.
+    Snipe,
+    /// Mirrored a followed wallet's buy.
+    Copy { leader: String },
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Position {
     pub mint: String,
@@ -118,6 +137,7 @@ pub struct Position {
     #[serde(skip)]
     pub creator: Pubkey,
     pub status: PositionStatus,
+    pub source: PositionSource,
     pub opened_ms: u64,
     pub sol: f64,
     pub sell_at_slot: u64,
@@ -239,6 +259,7 @@ pub struct Snapshot {
     pub uptime_secs: u64,
     pub settings: SettingsView,
     pub risk: RiskView,
+    pub copy: CopyView,
     pub session_spent_sol: f64,
     pub drawdown_sol: Option<f64>,
     pub positions: Vec<Position>,
@@ -251,6 +272,10 @@ pub struct Snapshot {
 pub struct AppState {
     pub settings: Settings,
     pub risk: RiskConfig,
+    pub copy: CopyConfig,
+    /// Mints a buy is currently being sent for, so two signals cannot both buy one token.
+    /// SOL reserved per mint for buys being sent, counted by [`Self::exposure`].
+    inflight: Mutex<HashMap<Pubkey, f64>>,
     wallet: String,
     started: Instant,
     slot: AtomicU64,
@@ -271,6 +296,8 @@ impl AppState {
         Self {
             settings,
             risk: RiskConfig::default(),
+            copy: CopyConfig::default(),
+            inflight: Mutex::new(HashMap::new()),
             wallet: wallet.to_string(),
             started: Instant::now(),
             slot: AtomicU64::new(0),
@@ -288,6 +315,11 @@ impl AppState {
 
     pub fn with_risk(mut self, risk: RiskConfig) -> Self {
         self.risk = risk;
+        self
+    }
+
+    pub fn with_copy(mut self, copy: CopyConfig) -> Self {
+        self.copy = copy;
         self
     }
 
@@ -340,6 +372,25 @@ impl AppState {
         sol: f64,
         sell_at_slot: u64,
     ) {
+        self.record_buy_sent_from(
+            mint,
+            creator,
+            signature,
+            sol,
+            sell_at_slot,
+            PositionSource::Snipe,
+        );
+    }
+
+    pub fn record_buy_sent_from(
+        &self,
+        mint: &Pubkey,
+        creator: &Pubkey,
+        signature: &str,
+        sol: f64,
+        sell_at_slot: u64,
+        source: PositionSource,
+    ) {
         {
             let mut positions = lock(&self.positions);
             if positions.len() >= MAX_POSITIONS {
@@ -356,6 +407,7 @@ impl AppState {
                 mint_key: *mint,
                 creator: *creator,
                 status: PositionStatus::Held,
+                source: source.clone(),
                 opened_ms: now_ms(),
                 sol,
                 sell_at_slot,
@@ -371,6 +423,7 @@ impl AppState {
             signature: signature.to_string(),
             sol,
             sell_at_slot,
+            source,
         });
     }
 
@@ -379,6 +432,58 @@ impl AppState {
             mint: mint.to_string(),
             error: clip(error),
         });
+    }
+
+    pub fn record_copy_signal(&self, trade: &LeaderTrade, slot: u64) {
+        self.publish(Event::CopySignal {
+            leader: trade.leader.to_string(),
+            mint: trade.mint.to_string(),
+            side: trade.side,
+            sol: trade.sol(),
+            slot,
+        });
+    }
+
+    /// True while we hold, are selling, or failed to sell this token (it may still be in the wallet).
+    pub fn has_active_position(&self, mint: &Pubkey) -> bool {
+        lock(&self.positions).iter().any(|p| {
+            p.mint_key == *mint
+                && matches!(
+                    p.status,
+                    PositionStatus::Held | PositionStatus::Selling | PositionStatus::Failed
+                )
+        })
+    }
+
+    /// True if we hold this token or a buy for it is being sent.
+    pub fn mint_busy(&self, mint: &Pubkey) -> bool {
+        lock(&self.inflight).contains_key(mint) || self.has_active_position(mint)
+    }
+
+    /// Reserves `sol` and the mint for a buy about to be sent, so two signals cannot both
+    /// buy one token and a burst of signals cannot slip past the risk limits before the
+    /// first buy is recorded. Returns false if the mint is busy. Pair with
+    /// [`Self::release_mint`] once the buy is recorded or has failed.
+    pub fn claim_mint(&self, mint: &Pubkey, sol: f64) -> bool {
+        let mut inflight = lock(&self.inflight);
+        if inflight.contains_key(mint) || self.has_active_position(mint) {
+            return false;
+        }
+        inflight.insert(*mint, sol);
+        true
+    }
+
+    pub fn release_mint(&self, mint: &Pubkey) {
+        lock(&self.inflight).remove(mint);
+    }
+
+    /// A copied position that is still waiting to be sold.
+    pub fn is_copy_held(&self, mint: &Pubkey) -> bool {
+        lock(&self.positions).iter().any(|p| {
+            p.mint_key == *mint
+                && p.status == PositionStatus::Held
+                && matches!(p.source, PositionSource::Copy { .. })
+        })
     }
 
     pub fn record_skipped(&self, mint: &Pubkey, reason: &str) {
@@ -413,9 +518,13 @@ impl AppState {
     }
 
     pub fn exposure(&self) -> Exposure {
+        let (pending, pending_sol) = {
+            let inflight = lock(&self.inflight);
+            (inflight.len(), inflight.values().sum::<f64>())
+        };
         Exposure {
-            open_positions: self.open_positions(),
-            session_spent_sol: self.session_spent_sol(),
+            open_positions: self.open_positions() + pending,
+            session_spent_sol: self.session_spent_sol() + pending_sol,
             balance_sol: self.balance_lamports().map(lamports_to_sol),
             start_balance_sol: self.start_balance_lamports().map(lamports_to_sol),
         }
@@ -523,6 +632,7 @@ impl AppState {
             uptime_secs: self.started.elapsed().as_secs(),
             settings: self.settings.view(),
             risk: self.risk.view(),
+            copy: self.copy.view(),
             session_spent_sol: self.session_spent_sol(),
             drawdown_sol: match (self.start_balance_lamports(), self.balance_lamports()) {
                 (Some(start), Some(now)) => Some(lamports_to_sol(start) - lamports_to_sol(now)),
@@ -660,6 +770,85 @@ mod tests {
         assert_eq!(st.open_positions(), 2, "selling still counts as open");
         st.record_sell_sent(&mint, "s", 1);
         assert_eq!(st.open_positions(), 1);
+    }
+
+    #[test]
+    fn mint_claims_block_duplicates_and_respect_closed_positions() {
+        let st = state();
+        let m = Pubkey::new_unique();
+        assert!(st.claim_mint(&m, 0.01));
+        assert!(st.mint_busy(&m));
+        assert!(
+            !st.claim_mint(&m, 0.01),
+            "a second buy for the same mint must lose"
+        );
+        st.release_mint(&m);
+        assert!(!st.mint_busy(&m));
+        assert!(st.claim_mint(&m, 0.01));
+        st.release_mint(&m);
+
+        st.record_buy_sent(&m, &Pubkey::new_unique(), "sig", 0.001, 1);
+        assert!(st.has_active_position(&m));
+        assert!(!st.claim_mint(&m, 0.01), "held tokens block a new buy");
+
+        st.begin_sell(&m).unwrap();
+        st.record_sell_failed(&m, "x");
+        assert!(
+            st.has_active_position(&m),
+            "a failed sell may still hold tokens"
+        );
+
+        st.begin_sell(&m).unwrap();
+        st.record_sell_sent(&m, "s", 1);
+        assert!(!st.has_active_position(&m));
+        assert!(
+            st.claim_mint(&m, 0.01),
+            "a sold position can be bought again"
+        );
+    }
+
+    #[test]
+    fn reserved_buys_count_towards_exposure_until_released() {
+        let st = state();
+        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        assert!(st.claim_mint(&a, 0.25));
+        assert!(st.claim_mint(&b, 0.5));
+        let e = st.exposure();
+        assert_eq!(e.open_positions, 2);
+        assert!((e.session_spent_sol - 0.75).abs() < 1e-9);
+
+        st.release_mint(&a);
+        let e = st.exposure();
+        assert_eq!(e.open_positions, 1);
+        assert!((e.session_spent_sol - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn position_source_is_recorded_and_serialized() {
+        let st = state();
+        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        st.record_buy_sent(&a, &Pubkey::new_unique(), "s", 0.001, 1);
+        st.record_buy_sent_from(
+            &b,
+            &Pubkey::new_unique(),
+            "s",
+            0.001,
+            1,
+            PositionSource::Copy { leader: "L".into() },
+        );
+        assert!(!st.is_copy_held(&a));
+        assert!(st.is_copy_held(&b));
+
+        let json = serde_json::to_value(st.snapshot().positions).unwrap();
+        assert_eq!(json[0]["source"]["kind"], "snipe");
+        assert_eq!(json[1]["source"]["kind"], "copy");
+        assert_eq!(json[1]["source"]["leader"], "L");
+
+        st.begin_sell(&b).unwrap();
+        assert!(
+            !st.is_copy_held(&b),
+            "only held copies are sold with the leader"
+        );
     }
 
     #[test]
