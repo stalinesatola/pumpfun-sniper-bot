@@ -9,7 +9,6 @@ use crate::types::BuyAmounts;
 use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_sdk::instruction::AccountMeta;
 
-// use jito_searcher_client::swqos::{FeeClientTrait, JitoClient};
 use log::info;
 
 use solana_sdk::pubkey;
@@ -19,15 +18,15 @@ use std::{str::FromStr, sync::Arc};
 
 use rustls::crypto::{ring::default_provider, CryptoProvider};
 
+use crate::types::sol_to_lamports;
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_sdk::{
-    compute_budget::ComputeBudgetInstruction, message::v0::Message as MessageV0,
-    native_token::sol_to_lamports, pubkey::Pubkey, signature::Keypair, system_instruction,
+    message::v0::Message as MessageV0, pubkey::Pubkey, signature::Keypair,
     transaction::VersionedTransaction,
 };
-use spl_associated_token_account::{
-    get_associated_token_address, instruction::create_associated_token_account_idempotent,
-};
+use solana_system_interface::instruction as system_instruction;
+use spl_associated_token_account::get_associated_token_address;
 
 use solana_sdk::hash::Hash;
 
@@ -66,7 +65,8 @@ pub struct PumpFunSellType {
 impl PumpFunSDK {
     pub async fn new(rpc_url: &str, astralane_url: &str, priority_fee: PriorityFeePump) -> Self {
         if CryptoProvider::get_default().is_none() {
-            default_provider().install_default().unwrap();
+            // Another thread may install a provider between the check and here; that is fine.
+            let _ = default_provider().install_default();
         }
         let client = Arc::new(RpcClient::new(String::from(rpc_url)));
         let astralane_client = Arc::new(RpcClient::new(astralane_url.to_string()));
@@ -232,7 +232,7 @@ impl PumpFunSDK {
         let zeroblock_fee =
             system_instruction::transfer(&user, &ZEROBLOCK_FEE, sol_to_lamports(0.0001));
 
-        let close_ata = spl_token_2022::instruction::close_account(
+        let close_ata = spl_token::instruction::close_account(
             &PUMPFUN_TOKEN_PROGRAM,
             &user_ata,
             &user,
@@ -337,6 +337,7 @@ impl PumpFunSDK {
         blockhash: Hash,
         buy_amounts: BuyAmounts,
         creator: Pubkey,
+        slippage_percent: u64,
     ) -> PumpFunResult<(String, u64)> {
         let pump_buy_order = PumpFunBuyType {
             mint: *mint,
@@ -344,7 +345,7 @@ impl PumpFunSDK {
             user_keypair,
             blockhash,
             buy_amounts,
-            slippage: 0,
+            slippage: slippage_percent,
             cu_price: 1,
             creator,
         };

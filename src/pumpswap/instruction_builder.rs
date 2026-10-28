@@ -2,8 +2,8 @@ use crate::pumpswap::{constants::*, error::PumpSwapResult};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    system_program,
 };
+use solana_system_interface::program as system_program;
 use spl_associated_token_account::get_associated_token_address;
 
 pub fn create_buy_instruction(

@@ -2,8 +2,8 @@ use crate::pumpfun::{constants::*, error::PumpFunResult};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    system_program,
 };
+use solana_system_interface::program as system_program;
 
 pub fn create_buy_instruction(
     user: &Pubkey,

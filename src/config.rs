@@ -22,7 +22,7 @@ fn required(name: &str) -> Result<String> {
     }
 }
 
-fn optional_parsed<T: FromStr>(name: &str, default: T) -> Result<T>
+pub fn optional_parsed<T: FromStr>(name: &str, default: T) -> Result<T>
 where
     T::Err: std::fmt::Display,
 {
@@ -35,7 +35,7 @@ where
     }
 }
 
-fn positive_sol(name: &str, value: f64) -> Result<f64> {
+pub fn positive_sol(name: &str, value: f64) -> Result<f64> {
     if value.is_finite() && value > 0.0 {
         Ok(value)
     } else {
@@ -44,12 +44,12 @@ fn positive_sol(name: &str, value: f64) -> Result<f64> {
 }
 
 /// Decode a base58 secret key without panicking (`Keypair::from_base58_string` panics).
-#[allow(deprecated)]
 pub fn keypair_from_base58(secret: &str) -> Result<Keypair> {
     let bytes = bs58::decode(secret.trim())
         .into_vec()
         .context("PVT_KEY is not valid base58")?;
-    Keypair::from_bytes(&bytes).map_err(|e| anyhow!("PVT_KEY is not a valid 64-byte keypair: {e}"))
+    Keypair::try_from(bytes.as_slice())
+        .map_err(|e| anyhow!("PVT_KEY is not a valid 64-byte keypair: {e}"))
 }
 
 impl Config {

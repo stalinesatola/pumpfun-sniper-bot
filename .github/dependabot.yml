@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      rust-minor-patch:
+        update-types: [minor, patch]
+    # Solana/SPL majors change APIs and wire-adjacent types; upgrade them deliberately
+    # (tests/golden_tx.rs must stay green).
+    ignore:
+      - dependency-name: "solana-*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "spl-*"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: npm
+    directory: /ui
+    schedule:
+      interval: weekly
+    groups:
+      ui-minor-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

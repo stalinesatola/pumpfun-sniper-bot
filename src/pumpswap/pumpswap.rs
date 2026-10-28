@@ -14,16 +14,18 @@ use solana_sdk::message::Message;
 use spl_associated_token_account::get_associated_token_address;
 use std::{str::FromStr, sync::Arc};
 
-use rustls::crypto::{CryptoProvider, ring::default_provider};
+use rustls::crypto::{ring::default_provider, CryptoProvider};
 
+use crate::types::sol_to_lamports;
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_sdk::hash::Hash;
 use solana_sdk::pubkey;
 use solana_sdk::{
-    compute_budget::ComputeBudgetInstruction, message::v0::Message as MessageV0,
-    native_token::sol_to_lamports, pubkey::Pubkey, signature::Keypair, system_instruction,
+    message::v0::Message as MessageV0, pubkey::Pubkey, signature::Keypair,
     transaction::VersionedTransaction,
 };
+use solana_system_interface::instruction as system_instruction;
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 
 const ASTRALANE_TIP: Pubkey = pubkey!("astra4uejePWneqNaJKuFFA8oonqCE1sqF6b45kDMZm");
@@ -63,7 +65,8 @@ impl PumpSwapSDK {
     /// Create a new PumpSwapSDK instance
     pub async fn new(rpc_url: &str, astralane_url: &str, priority_fee: PriorityFeePump) -> Self {
         if CryptoProvider::get_default().is_none() {
-            default_provider().install_default().unwrap();
+            // Another thread may install a provider between the check and here; that is fine.
+            let _ = default_provider().install_default();
         }
         let client = Arc::new(RpcClient::new(String::from(rpc_url)));
         let astralane_client = Arc::new(RpcClient::new(astralane_url.to_string()));
@@ -136,11 +139,11 @@ impl PumpSwapSDK {
 
         // Create instruction to sync WSOL account after transfer
         let sync_native_ix =
-            spl_token_2022::instruction::sync_native(&TOKEN_PROGRAM_ID, &user_wsol_token_account)
+            spl_token::instruction::sync_native(&TOKEN_PROGRAM_ID, &user_wsol_token_account)
                 .unwrap();
 
         // Create instruction to close WSOL account after swap
-        let close_wsol_account_ix = spl_token_2022::instruction::close_account(
+        let close_wsol_account_ix = spl_token::instruction::close_account(
             &TOKEN_PROGRAM_ID,
             &user_wsol_token_account,
             &user,
@@ -226,11 +229,11 @@ impl PumpSwapSDK {
 
         // Create instruction to sync WSOL account
         let sync_native_ix =
-            spl_token_2022::instruction::sync_native(&TOKEN_PROGRAM_ID, &user_wsol_token_account)
+            spl_token::instruction::sync_native(&TOKEN_PROGRAM_ID, &user_wsol_token_account)
                 .unwrap();
 
         // Create instruction to close WSOL account after swap
-        let close_wsol_account_ix = spl_token_2022::instruction::close_account(
+        let close_wsol_account_ix = spl_token::instruction::close_account(
             &TOKEN_PROGRAM_ID,
             &user_wsol_token_account,
             &user,
