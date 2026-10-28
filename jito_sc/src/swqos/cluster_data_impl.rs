@@ -232,11 +232,9 @@ mod rpc_utils {
         while !exit.load(Ordering::Relaxed) {
             sleep(Duration::from_secs(1)).await;
 
-            match PubsubClient::new(
-                "wss://mainnet.helius-rpc.com/?api-key=REMOVED_SECRET",
-            )
-            .await
-            {
+            // Websocket RPC used for slot updates (only needed when the Jito searcher client is enabled).
+            let ws_url = std::env::var("WS_URL").unwrap_or_default();
+            match PubsubClient::new(&ws_url).await {
                 Ok(pubsub_client) => match pubsub_client.slot_updates_subscribe().await {
                     Ok((mut slot_update_subscription, _unsubscribe_fn)) => {
                         while let Some(slot_update) = slot_update_subscription.next().await {

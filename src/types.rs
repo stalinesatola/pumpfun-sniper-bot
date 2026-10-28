@@ -14,6 +14,7 @@ use solana_sdk::transaction::VersionedTransaction;
 
 pub const PUMP_AMM_PROGRAM_ID_STR: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 pub const PUMP_FUN_PROGRAM_ID_STR: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+pub const PUMP_FUN_PROGRAM_ID: Pubkey = pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
 
@@ -121,9 +122,7 @@ fn create_base_tx_pumpswap(
 ) -> Result<PumpSwapTXInfo, TXParserError> {
     let blockhash = tx.message.recent_blockhash().to_owned();
     let account_keys = tx.message.static_account_keys();
-    // let client = RpcClient::new(
-    //     "https://mainnet.helius-rpc.com/?api-key=REMOVED_SECRET".to_string(),
-    // );
+    // let client = RpcClient::new(std::env::var("RPC_URL").unwrap());
 
     // let mut keys = Vec::new();
     // let lookup_table = tx.message.address_table_lookups();
@@ -343,55 +342,52 @@ fn create_base_create_tx_pumpfun(
     let blockhash = tx.message.recent_blockhash().to_owned();
     let account_keys = tx.message.static_account_keys();
 
-    if account_keys.len() < 12 {
-        println!("This transaction doesn't even have enough wallets.");
-        return Err(TXParserError::MissingAccountKeys);
-    }
+    // Resolve the n-th account of an instruction to its pubkey, without ever panicking on
+    // malformed or lookup-table based transactions.
+    let key_at = |ix: &CompiledInstruction, n: usize| -> Result<Pubkey, TXParserError> {
+        ix.accounts
+            .get(n)
+            .and_then(|idx| account_keys.get(*idx as usize))
+            .copied()
+            .ok_or(TXParserError::MissingAccountKeys)
+    };
 
-    if account_keys.len() < ix.accounts.iter().max().unwrap().to_owned() as usize {
-        println!("Missing account keys!");
-        println!(
-            "Account Keys: {:?}\nIX Account keys: {:?}",
-            account_keys, ix.accounts
-        );
-        return Err(TXParserError::NotEnoughWallets);
-    }
-
-    // 17 acccounts in there
-    let mint = account_keys[ix.accounts[0] as usize];
-    // let mint_authority = account_keys[ix.accounts[1] as usize];
-    let bonding_curve = account_keys[ix.accounts[2] as usize];
-    let associated_bonding_curve = account_keys[ix.accounts[4] as usize];
+    let mint = key_at(ix, 0)?;
+    let bonding_curve = key_at(ix, 2)?;
+    let associated_bonding_curve = key_at(ix, 4)?;
     let default_key = Pubkey::default();
 
     let mut creator: Pubkey = Pubkey::default();
     let mut amounts = Amounts::default();
 
     for instructions in tx.message.instructions() {
-        let program_id = account_keys[instructions.program_id_index as usize];
+        let Some(program_id) = account_keys.get(instructions.program_id_index as usize) else {
+            continue;
+        };
 
-        if program_id == Pubkey::from_str(PUMP_FUN_PROGRAM_ID_STR).unwrap() {
-            let data_prefix: [u8; 8] = instructions.data[0..8].try_into().unwrap();
-            if data_prefix == PUMP_ORDER_BUY {
-                creator = account_keys[instructions.accounts[9] as usize];
-                let base_amount_out = u64::from_le_bytes(
-                    instructions.data[instructions.data.len() - 16..instructions.data.len() - 8]
-                        .try_into()
-                        .unwrap_or_default(),
-                );
-                let max_quote_amount_in = u64::from_le_bytes(
-                    instructions.data[instructions.data.len() - 8..instructions.data.len()]
-                        .try_into()
-                        .unwrap_or_default(),
-                );
-
-                amounts = Amounts::BuyAmounts(BuyAmounts {
-                    base_amount_out,
-                    max_quote_amount_in,
-                });
-                break;
-            }
+        if *program_id != PUMP_FUN_PROGRAM_ID {
+            continue;
         }
+
+        // discriminator (8) + amount (8) + max_sol_cost (8); newer layouts may append more bytes.
+        let data = &instructions.data;
+        if data.len() < 24 || data[0..8] != PUMP_ORDER_BUY {
+            continue;
+        }
+
+        let Ok(buyer_creator) = key_at(instructions, 9) else {
+            continue;
+        };
+        creator = buyer_creator;
+
+        let base_amount_out = u64::from_le_bytes(data[8..16].try_into().unwrap_or_default());
+        let max_quote_amount_in = u64::from_le_bytes(data[16..24].try_into().unwrap_or_default());
+
+        amounts = Amounts::BuyAmounts(BuyAmounts {
+            base_amount_out,
+            max_quote_amount_in,
+        });
+        break;
     }
 
     Ok(PumpFunTXInfo {
@@ -494,3 +490,77 @@ impl PumpFunTXInfo {
 
 pub const PUMP_ORDER_BUY: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 pub const PUMP_ORDER_SELL: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::message::{Message, VersionedMessage};
+
+    const CREATE: [u8; 8] = [24, 30, 200, 40, 5, 28, 7, 119];
+
+    fn tx_with(keys: Vec<Pubkey>, instructions: Vec<CompiledInstruction>) -> VersionedTransaction {
+        let mut message = Message::new_with_blockhash(&[], None, &Hash::default());
+        message.account_keys = keys;
+        message.instructions = instructions;
+        VersionedTransaction {
+            signatures: vec![],
+            message: VersionedMessage::Legacy(message),
+        }
+    }
+
+    fn buy_data(amount: u64, max_cost: u64) -> Vec<u8> {
+        let mut data = PUMP_ORDER_BUY.to_vec();
+        data.extend_from_slice(&amount.to_le_bytes());
+        data.extend_from_slice(&max_cost.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn create_tx_with_missing_accounts_is_an_error_not_a_panic() {
+        let keys = vec![PUMP_FUN_PROGRAM_ID, Pubkey::new_unique()];
+        let create = CompiledInstruction::new_from_raw_parts(0, CREATE.to_vec(), vec![1, 1]);
+        let tx = tx_with(keys, vec![create.clone()]);
+        assert!(PumpFunTXInfo::from_create_tx(&tx, &create).is_err());
+
+        let empty = CompiledInstruction::new_from_raw_parts(0, CREATE.to_vec(), vec![]);
+        let tx = tx_with(vec![PUMP_FUN_PROGRAM_ID], vec![empty.clone()]);
+        assert!(PumpFunTXInfo::from_create_tx(&tx, &empty).is_err());
+    }
+
+    #[test]
+    fn create_tx_extracts_creator_buy() {
+        let keys: Vec<Pubkey> = std::iter::once(PUMP_FUN_PROGRAM_ID)
+            .chain((0..11).map(|_| Pubkey::new_unique()))
+            .collect();
+        let accounts: Vec<u8> = (1..=10).collect();
+        let create = CompiledInstruction::new_from_raw_parts(0, CREATE.to_vec(), accounts.clone());
+        let buy = CompiledInstruction::new_from_raw_parts(0, buy_data(5, 7), accounts);
+        let tx = tx_with(keys.clone(), vec![create.clone(), buy]);
+
+        let info = PumpFunTXInfo::from_create_tx(&tx, &create).unwrap();
+        assert_eq!(info.mint, keys[1]);
+        assert_eq!(info.creator, keys[10]);
+        assert_eq!(
+            info.amounts,
+            Amounts::BuyAmounts(BuyAmounts {
+                base_amount_out: 5,
+                max_quote_amount_in: 7
+            })
+        );
+    }
+
+    #[test]
+    fn short_buy_data_is_ignored() {
+        let keys: Vec<Pubkey> = std::iter::once(PUMP_FUN_PROGRAM_ID)
+            .chain((0..11).map(|_| Pubkey::new_unique()))
+            .collect();
+        let accounts: Vec<u8> = (1..=10).collect();
+        let create = CompiledInstruction::new_from_raw_parts(0, CREATE.to_vec(), accounts.clone());
+        let short_buy =
+            CompiledInstruction::new_from_raw_parts(0, PUMP_ORDER_BUY.to_vec(), accounts);
+        let tx = tx_with(keys, vec![create.clone(), short_buy]);
+
+        let info = PumpFunTXInfo::from_create_tx(&tx, &create).unwrap();
+        assert_eq!(info.amounts, Amounts::Unknown);
+    }
+}

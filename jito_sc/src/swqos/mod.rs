@@ -81,9 +81,13 @@ impl FeeClientTrait for JitoClient {
 }
 
 impl JitoClient {
-    pub async fn new(rpc_url: String, block_engine_url: String) -> Result<Self> {
+    pub async fn new(
+        rpc_url: String,
+        block_engine_url: String,
+        auth_keypair: Keypair,
+    ) -> Result<Self> {
         let rpc_client = SolanaRpcClient::new(rpc_url.clone());
-        let keypair = Arc::new(Keypair::from_base58_string("REMOVED_SECRET"));
+        let keypair = Arc::new(auth_keypair);
         let exit: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let (searcher_client, w) =
             get_searcher_client_auth(&keypair, &exit, block_engine_url.as_str(), rpc_url.as_str())

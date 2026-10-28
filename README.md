@@ -73,21 +73,30 @@ Shredstream proxy  →  deserialize entries  →  scan Pump.fun program
 
 ## Configuration
 
-Copy `.example.env` → `.env` (gitignored — never commit keys):
+Copy `.example.env` → `.env` (gitignored — never commit keys). Nothing secret or provider-specific is hardcoded; the bot refuses to start if a required variable is missing or invalid.
 
 ```env
-SOL_BUY_AMOUNT=0.001
-BRIBE_FEE=0.001
-SHREDSTREAM_URL=http://YOUR_SHREDSTREAM_HOST:9999
 PVT_KEY=BASE58_PVT_KEY_HERE
+RPC_URL=https://YOUR_RPC_HOST/?api-key=YOUR_KEY
+ASTRALANE_URL=http://YOUR_ASTRALANE_HOST/iris?api-key=YOUR_KEY
+SHREDSTREAM_URL=http://YOUR_SHREDSTREAM_HOST:9999
+SOL_BUY_AMOUNT=0.0001
+BRIBE_FEE=0.0001
+SELL_DELAY_SLOTS=7
 ```
 
-| Variable | Description |
-| --- | --- |
-| `SOL_BUY_AMOUNT` | SOL size per Pump.fun buy |
-| `BRIBE_FEE` | Landing tip (Jito / bribe) in SOL |
-| `SHREDSTREAM_URL` | Jito shredstream proxy |
-| `PVT_KEY` | Wallet secret in base58 |
+| Variable | Required | Description |
+| --- | --- | --- |
+| `PVT_KEY` | yes | Wallet secret in base58 |
+| `RPC_URL` | yes | RPC used for balances and blockhashes |
+| `ASTRALANE_URL` | yes | Endpoint transactions are sent through |
+| `SHREDSTREAM_URL` | yes | Jito shredstream proxy |
+| `SOL_BUY_AMOUNT` | no (0.0001) | SOL size per Pump.fun buy |
+| `BRIBE_FEE` | no (0.0001) | Landing tip in SOL |
+| `SELL_DELAY_SLOTS` | no (7) | Slots to wait before selling |
+| `WS_URL` | no | Websocket RPC, only for the (currently unused) Jito searcher client |
+
+The sell reads the real token balance on-chain and uses a fresh blockhash, retrying a few times. If the buy never landed there is nothing to sell and the position is dropped with a log line. If the Shredstream connection drops, the bot reconnects with backoff and keeps its pending sells.
 
 ## Build and run
 
