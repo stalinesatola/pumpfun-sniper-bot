@@ -60,6 +60,10 @@ fn describe(e: &Stamped) -> (Color, String) {
         Event::BuyFailed { mint, error } => {
             (Color::Red, format!("buy FAIL  {} {error}", short(mint)))
         }
+        Event::Skipped { mint, reason } => (
+            Color::DarkGray,
+            format!("skip      {} {reason}", short(mint)),
+        ),
         Event::SellStarted { mint } => (Color::Yellow, format!("selling   {}", short(mint))),
         Event::SellSent { mint, amount, .. } => (
             Color::Green,
@@ -99,7 +103,7 @@ fn describe(e: &Stamped) -> (Color, String) {
 
 fn draw(f: &mut Frame, snap: &Snapshot, table: &mut TableState) {
     let [header, body, footer] = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(5),
         Constraint::Min(6),
         Constraint::Length(1),
     ])
@@ -140,6 +144,16 @@ fn draw(f: &mut Frame, snap: &Snapshot, table: &mut TableState) {
                 snap.settings.buy_amount_sol,
                 snap.settings.bribe_fee_sol,
                 snap.settings.sell_delay_slots
+            )),
+            Line::from(format!(
+                "spent {:.4} SOL (cap {})   drawdown {}   slippage {}%",
+                snap.session_spent_sol,
+                snap.risk.max_session_spend_sol,
+                snap.drawdown_sol.map_or("…".to_string(), |d| format!(
+                    "{d:.4} SOL (cap {})",
+                    snap.risk.max_session_drawdown_sol
+                )),
+                snap.risk.buy_slippage_percent
             )),
         ])
         .block(Block::bordered().title(" pumpfun sniper ")),

@@ -11,6 +11,7 @@ export const bot = $state({
   events: [], // newest first
   balance: { t: [], v: [] }, // for the chart, SOL
   createsSeen: 0,
+  startLamports: null, // wallet balance when the bot started, to show the drawdown live
 });
 
 function readToken() {
@@ -53,6 +54,10 @@ function pushBalance(ts, lamports) {
 
 function loadSnapshot(snap) {
   bot.snap = snap;
+  bot.startLamports =
+    snap.balance_lamports != null && snap.drawdown_sol != null
+      ? snap.balance_lamports + Math.round(snap.drawdown_sol * 1e9)
+      : null;
   bot.events = [...snap.recent].reverse();
   bot.createsSeen = snap.recent.filter((e) => e.type === 'create_detected').length;
   bot.balance = { t: [], v: [] };
@@ -67,6 +72,7 @@ function applyEvent(e) {
       bot.createsSeen++;
       break;
     case 'buy_sent':
+      s.session_spent_sol += e.sol;
       s.positions.push({
         mint: e.mint, status: 'held', opened_ms: e.ts_ms, sol: e.sol,
         sell_at_slot: e.sell_at_slot, buy_signature: e.signature, sell_signature: null, error: null,
@@ -83,6 +89,8 @@ function applyEvent(e) {
       break;
     case 'balance':
       s.balance_lamports = e.lamports;
+      if (bot.startLamports == null) bot.startLamports = e.lamports;
+      s.drawdown_sol = (bot.startLamports - e.lamports) / 1e9;
       pushBalance(e.ts_ms, e.lamports);
       break;
     case 'stream':

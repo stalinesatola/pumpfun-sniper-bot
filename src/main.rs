@@ -14,6 +14,7 @@ use shred_pool_cache::api::{self, ApiConfig};
 use shred_pool_cache::config::Config;
 use shred_pool_cache::pumpfun::PumpFunSDK;
 use shred_pool_cache::pumpswap::constants::PriorityFeePump;
+use shred_pool_cache::risk::{lamports_to_sol, Candidate, RiskConfig};
 use shred_pool_cache::state::{AppState, Settings};
 use shred_pool_cache::trader::Trader;
 use shred_pool_cache::types::*;
@@ -63,6 +64,18 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env().context("invalid configuration (check your .env)")?;
     let api_config = ApiConfig::from_env().context("invalid API configuration")?;
+    let risk = RiskConfig::from_env().context("invalid risk configuration")?;
+    info!(
+        "Risk: max {} open, spend cap {} SOL, drawdown cap {} SOL, slippage {}%, dev buy {}..{} SOL, {} blocked creators, {} blocked keywords (0 = off)",
+        risk.max_open_positions,
+        risk.max_session_spend_sol,
+        risk.max_session_drawdown_sol,
+        risk.buy_slippage_percent,
+        risk.min_dev_buy_sol,
+        risk.max_dev_buy_sol,
+        risk.blocked_creators.len(),
+        risk.blocked_keywords.len()
+    );
     info!(
         "Wallet {} | buy {} SOL | tip {} SOL | sell after {} slots",
         config.payer.pubkey(),
@@ -238,8 +251,27 @@ async fn run_stream(config: &Config, trader: &Trader) -> Result<()> {
 
                 // Settings can change from the dashboard at any time; read them per buy.
                 let buy_amount_sol = state.settings.buy_amount_sol();
+                let tip_sol = state.settings.bribe_fee_sol();
+
+                let meta = parse_create_metadata(&create_ix.data);
+                let candidate = Candidate {
+                    creator: &parsed_txn.creator,
+                    name: meta.as_ref().map(|m| m.0.as_str()),
+                    symbol: meta.as_ref().map(|m| m.1.as_str()),
+                    dev_buy_sol: lamports_to_sol(buy_amount.max_quote_amount_in),
+                };
+                if let Err(reason) =
+                    state
+                        .risk
+                        .check(&candidate, &state.exposure(), buy_amount_sol, tip_sol)
+                {
+                    info!("Skipping {}: {}", parsed_txn.mint, reason);
+                    state.record_skipped(&parsed_txn.mint, &reason);
+                    continue;
+                }
+
                 let mut sdk = trader.sdk.clone();
-                sdk.priority_fee.jito_tip_fee = state.settings.bribe_fee_sol();
+                sdk.priority_fee.jito_tip_fee = tip_sol;
 
                 info!(
                     "Sniping mint {} (creator {})",
@@ -254,6 +286,7 @@ async fn run_stream(config: &Config, trader: &Trader) -> Result<()> {
                         parsed_txn.blockhash,
                         buy_amount,
                         parsed_txn.creator,
+                        state.risk.buy_slippage_percent,
                     )
                     .await;
 

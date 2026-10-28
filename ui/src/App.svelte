@@ -50,13 +50,14 @@
   const eventStyle = {
     buy_sent: 'text-good', sell_sent: 'text-good', buy_failed: 'text-bad', sell_failed: 'text-bad',
     sell_started: 'text-warn', paused: 'text-warn', stream: 'text-warn', settings_changed: 'text-accent',
-    create_detected: 'text-dim', balance: 'text-dim',
+    create_detected: 'text-dim', balance: 'text-dim', skipped: 'text-dim',
   };
 
   function describe(e) {
     switch (e.type) {
       case 'create_detected': return `create ${short(e.mint)} @ ${e.slot}`;
       case 'buy_sent': return `buy ${short(e.mint)} ${e.sol} SOL, sell at ${e.sell_at_slot}`;
+      case 'skipped': return `skipped ${short(e.mint)}: ${e.reason}`;
       case 'buy_failed': return `buy failed ${short(e.mint)}: ${e.error}`;
       case 'sell_started': return `selling ${short(e.mint)}`;
       case 'sell_sent': return `sold ${short(e.mint)} (${e.amount} tokens)`;
@@ -97,6 +98,14 @@
       <span class={snap.stream_connected ? 'text-good' : 'text-bad'}>stream {snap.stream_connected ? 'up' : 'down'}</span>
       <span class="text-dim">slot <span class="num text-ink">{snap.slot}</span></span>
       <span class="text-dim">balance <span class="num text-ink">{sol(snap.balance_lamports)} SOL</span></span>
+      <span class="text-dim" title="Total SOL spent on buys this run / cap">
+        spent <span class="num text-ink">{snap.session_spent_sol.toFixed(4)}{snap.risk.max_session_spend_sol > 0 ? ` / ${snap.risk.max_session_spend_sol}` : ''} SOL</span>
+      </span>
+      {#if snap.drawdown_sol != null}
+        <span class="text-dim" title="Wallet balance below its starting value (open positions count as spent)">
+          drawdown <span class="num {snap.risk.max_session_drawdown_sol > 0 && snap.drawdown_sol >= snap.risk.max_session_drawdown_sol ? 'text-bad' : 'text-ink'}">{snap.drawdown_sol.toFixed(4)} SOL</span>
+        </span>
+      {/if}
       <span class="text-dim">creates seen <span class="num text-ink">{bot.createsSeen}</span></span>
       <span class="num text-dim" title={snap.wallet}>{short(snap.wallet)}</span>
       <span class="ml-auto flex items-center gap-3">
@@ -136,6 +145,24 @@
         </button>
       </form>
     </div>
+
+    <section class="rounded-lg border border-line bg-panel p-4 text-sm">
+      <h2 class="mb-2 font-medium text-dim">Risk limits (set in .env, 0 = off)</h2>
+      <dl class="num grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3 lg:grid-cols-5">
+        {#each [
+          ['max open positions', snap.risk.max_open_positions],
+          ['session spend cap', `${snap.risk.max_session_spend_sol} SOL`],
+          ['drawdown cap', `${snap.risk.max_session_drawdown_sol} SOL`],
+          ['buy slippage', `${snap.risk.buy_slippage_percent}%`],
+          ['dev buy range', `${snap.risk.min_dev_buy_sol}..${snap.risk.max_dev_buy_sol} SOL`],
+          ['balance reserve', `${snap.risk.min_balance_reserve_sol} SOL`],
+          ['blocked creators', snap.risk.blocked_creators],
+          ['blocked keywords', snap.risk.blocked_keywords.join(', ') || '-'],
+        ] as [label, value]}
+          <div><dt class="font-sans text-dim">{label}</dt><dd>{value}</dd></div>
+        {/each}
+      </dl>
+    </section>
 
     <section class="overflow-x-auto rounded-lg border border-line bg-panel">
       <h2 class="px-4 pt-4 text-sm font-medium text-dim">Positions</h2>

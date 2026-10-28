@@ -8,6 +8,7 @@ use solana_sdk::pubkey::Pubkey;
 use tokio::sync::broadcast;
 
 use crate::config::{positive_sol, Config};
+use crate::risk::{lamports_to_sol, Exposure, RiskConfig, RiskView};
 
 const MAX_RECENT_EVENTS: usize = 200;
 const MAX_POSITIONS: usize = 500;
@@ -60,6 +61,10 @@ pub enum Event {
     BuyFailed {
         mint: String,
         error: String,
+    },
+    Skipped {
+        mint: String,
+        reason: String,
     },
     SellStarted {
         mint: String,
@@ -233,6 +238,9 @@ pub struct Snapshot {
     pub stream_connected: bool,
     pub uptime_secs: u64,
     pub settings: SettingsView,
+    pub risk: RiskView,
+    pub session_spent_sol: f64,
+    pub drawdown_sol: Option<f64>,
     pub positions: Vec<Position>,
     pub recent: Vec<Stamped>,
 }
@@ -242,11 +250,15 @@ pub struct Snapshot {
 /// publishes an event; nothing here ever waits on a consumer.
 pub struct AppState {
     pub settings: Settings,
+    pub risk: RiskConfig,
     wallet: String,
     started: Instant,
     slot: AtomicU64,
     balance_lamports: AtomicU64,
     has_balance: AtomicBool,
+    start_balance_lamports: AtomicU64,
+    has_start_balance: AtomicBool,
+    spent_lamports: AtomicU64,
     stream_connected: AtomicBool,
     positions: Mutex<Vec<Position>>,
     recent: Mutex<VecDeque<Stamped>>,
@@ -258,16 +270,25 @@ impl AppState {
         let (bus, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             settings,
+            risk: RiskConfig::default(),
             wallet: wallet.to_string(),
             started: Instant::now(),
             slot: AtomicU64::new(0),
             balance_lamports: AtomicU64::new(0),
             has_balance: AtomicBool::new(false),
+            start_balance_lamports: AtomicU64::new(0),
+            has_start_balance: AtomicBool::new(false),
+            spent_lamports: AtomicU64::new(0),
             stream_connected: AtomicBool::new(false),
             positions: Mutex::new(Vec::new()),
             recent: Mutex::new(VecDeque::with_capacity(MAX_RECENT_EVENTS)),
             bus,
         }
+    }
+
+    pub fn with_risk(mut self, risk: RiskConfig) -> Self {
+        self.risk = risk;
+        self
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Stamped> {
@@ -343,6 +364,8 @@ impl AppState {
                 error: None,
             });
         }
+        self.spent_lamports
+            .fetch_add((sol * 1e9) as u64, Ordering::Relaxed);
         self.publish(Event::BuySent {
             mint: mint.to_string(),
             signature: signature.to_string(),
@@ -356,6 +379,46 @@ impl AppState {
             mint: mint.to_string(),
             error: clip(error),
         });
+    }
+
+    pub fn record_skipped(&self, mint: &Pubkey, reason: &str) {
+        self.publish(Event::Skipped {
+            mint: mint.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+
+    pub fn balance_lamports(&self) -> Option<u64> {
+        self.has_balance
+            .load(Ordering::Relaxed)
+            .then(|| self.balance_lamports.load(Ordering::Relaxed))
+    }
+
+    fn start_balance_lamports(&self) -> Option<u64> {
+        self.has_start_balance
+            .load(Ordering::Relaxed)
+            .then(|| self.start_balance_lamports.load(Ordering::Relaxed))
+    }
+
+    pub fn session_spent_sol(&self) -> f64 {
+        lamports_to_sol(self.spent_lamports.load(Ordering::Relaxed))
+    }
+
+    /// Positions that still hold tokens or are being sold.
+    pub fn open_positions(&self) -> usize {
+        lock(&self.positions)
+            .iter()
+            .filter(|p| matches!(p.status, PositionStatus::Held | PositionStatus::Selling))
+            .count()
+    }
+
+    pub fn exposure(&self) -> Exposure {
+        Exposure {
+            open_positions: self.open_positions(),
+            session_spent_sol: self.session_spent_sol(),
+            balance_sol: self.balance_lamports().map(lamports_to_sol),
+            start_balance_sol: self.start_balance_lamports().map(lamports_to_sol),
+        }
     }
 
     /// Positions in `Held` whose sell slot has been reached.
@@ -423,6 +486,10 @@ impl AppState {
     pub fn record_balance(&self, lamports: u64) {
         self.balance_lamports.store(lamports, Ordering::Relaxed);
         self.has_balance.store(true, Ordering::Relaxed);
+        if !self.has_start_balance.swap(true, Ordering::Relaxed) {
+            self.start_balance_lamports
+                .store(lamports, Ordering::Relaxed);
+        }
         self.publish(Event::Balance { lamports });
     }
 
@@ -451,13 +518,16 @@ impl AppState {
         Snapshot {
             wallet: self.wallet.clone(),
             slot: self.slot(),
-            balance_lamports: self
-                .has_balance
-                .load(Ordering::Relaxed)
-                .then(|| self.balance_lamports.load(Ordering::Relaxed)),
+            balance_lamports: self.balance_lamports(),
             stream_connected: self.stream_connected.load(Ordering::Relaxed),
             uptime_secs: self.started.elapsed().as_secs(),
             settings: self.settings.view(),
+            risk: self.risk.view(),
+            session_spent_sol: self.session_spent_sol(),
+            drawdown_sol: match (self.start_balance_lamports(), self.balance_lamports()) {
+                (Some(start), Some(now)) => Some(lamports_to_sol(start) - lamports_to_sol(now)),
+                _ => None,
+            },
             positions: lock(&self.positions).clone(),
             recent: lock(&self.recent).iter().cloned().collect(),
         }
@@ -566,6 +636,30 @@ mod tests {
             st.record_balance(1);
         }
         assert_eq!(st.snapshot().recent.len(), MAX_RECENT_EVENTS);
+    }
+
+    #[test]
+    fn exposure_tracks_spend_open_positions_and_drawdown() {
+        let st = state();
+        assert_eq!(st.exposure().open_positions, 0);
+        assert!(st.snapshot().drawdown_sol.is_none());
+
+        st.record_balance(2_000_000_000);
+        st.record_balance(1_750_000_000); // start balance stays the first one seen
+        let mint = buy(&st, 1);
+        buy(&st, 1);
+
+        let e = st.exposure();
+        assert_eq!(e.open_positions, 2);
+        assert!((e.session_spent_sol - 0.002).abs() < 1e-9);
+        assert_eq!(e.start_balance_sol, Some(2.0));
+        assert_eq!(e.balance_sol, Some(1.75));
+        assert!((st.snapshot().drawdown_sol.unwrap() - 0.25).abs() < 1e-9);
+
+        st.begin_sell(&mint).unwrap();
+        assert_eq!(st.open_positions(), 2, "selling still counts as open");
+        st.record_sell_sent(&mint, "s", 1);
+        assert_eq!(st.open_positions(), 1);
     }
 
     #[test]

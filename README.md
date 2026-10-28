@@ -1,6 +1,6 @@
 # Pump.fun Sniper Bot — Solana Memecoin Sniper (Rust + Jito Shredstream)
 
-**Live Pump.fun sniper** for Solana. Detects new token creates from **Jito Shredstream**, buys in the same slot window, and exits on a delayed sell. Built in **Rust** with **Pump.fun**, **PumpSwap**, **Orca Whirlpool**, and **Jito bundle** execution — not a Node toy, not a log-subscribe bot.
+**Live Pump.fun sniper** for Solana. Detects new token creates from **Jito Shredstream**, buys in the same slot window, and exits on a delayed sell. Built in **Rust** with **Pump.fun** and **PumpSwap** SDKs — not a Node toy, not a log-subscribe bot.
 
 **Contact / custom builds:** [t.me/dexoryn](https://t.me/dexoryn)
 
@@ -24,12 +24,10 @@ If you need a **private sniper**, copy-trade, or a custom shredstream cluster (C
 
 - **Pump.fun create sniper** — parse mint, creator, amounts, and blockhash from the create tx
 - **Jito Shredstream** — `ShredstreamProxy` subscribe, not Yellowstone-only logs
+- **Risk limits** — position / spend / drawdown caps, slippage, creator and keyword filters
+- **Dashboard** — web panel and terminal UI with live settings
 - **Pump.fun SDK** — buy / sell instruction builder + versioned transactions
 - **PumpSwap SDK** — AMM pool math, slippage, buy/sell execution
-- **Orca Whirlpool** — state decode, tick arrays, Raydium / Kamino helpers
-- **Jito searcher + SWQoS** — protobuf crate, bundle client, tip accounts (compiled but not used: transactions are sent through the Astralane endpoint)
-- **Yellowstone gRPC** — token-balance stream manager (`src/grpc.rs`, not part of the build)
-- **Copy-trade listener** — follow wallets off the same shredstream pipe (`src/copy.rs`, not part of the build)
 - **Pinned stack** — Rust 1.85.1, Solana SDK 2.2.1, thin LTO release builds
 
 ## Stack
@@ -39,9 +37,8 @@ If you need a **private sniper**, copy-trade, or a custom shredstream cluster (C
 | Language | Rust 1.85.1 (`rustfmt` + `clippy`) |
 | Chain | Solana 2.2.1 |
 | Ingest | Jito Shredstream gRPC |
-| Venues | Pump.fun · PumpSwap · Orca Whirlpool |
-| Landing | Jito bundles / SWQoS + bribe tips |
-| Streams | Yellowstone gRPC |
+| Venues | Pump.fun · PumpSwap (SDK, not used by the sniper loop) |
+| Landing | Astralane endpoint + tip |
 | Runtime | Tokio, moka cache, rustls |
 
 ## How it works
@@ -69,7 +66,7 @@ Shredstream proxy  →  deserialize entries  →  scan Pump.fun program
 - Rust **1.85.1** (see `rust-toolchain.toml`)
 - A funded Solana wallet
 - Shredstream endpoint (not public RPC)
-- Optional: Jito block engine / SWQoS key for bundles
+- An Astralane endpoint (or compatible) to send transactions through
 
 ## Configuration
 
@@ -94,7 +91,23 @@ SELL_DELAY_SLOTS=7
 | `SOL_BUY_AMOUNT` | no (0.0001) | SOL size per Pump.fun buy |
 | `BRIBE_FEE` | no (0.0001) | Landing tip in SOL |
 | `SELL_DELAY_SLOTS` | no (7) | Slots to wait before selling |
-| `WS_URL` | no | Websocket RPC, only for the (currently unused) Jito searcher client |
+
+### Risk limits
+
+Every new token is checked before a buy; a refused one shows up as `skipped` in the dashboard with the reason. Set `0` to turn a limit off.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MAX_OPEN_POSITIONS` | 3 | Positions held or being sold at once |
+| `MAX_SESSION_SPEND_SOL` | 1.0 | Total SOL spent on buys per run |
+| `MAX_SESSION_DRAWDOWN_SOL` | 0.5 | Stop buying when the wallet is this far below its starting balance (open positions count as spent until sold) |
+| `MIN_BALANCE_RESERVE_SOL` | 0.01 | SOL that must remain after a buy |
+| `BUY_SLIPPAGE_PERCENT` | 5 | Extra SOL (in %) the buy may cost if the price moves before it lands; max 50 |
+| `MIN_DEV_BUY_SOL` / `MAX_DEV_BUY_SOL` | off | Only tokens whose creator buys within this range at launch |
+| `BLOCKED_CREATORS` | none | Comma-separated creator addresses to ignore |
+| `BLOCKED_KEYWORDS` | none | Comma-separated words; a token whose name or symbol contains one is ignored |
+
+Sells still go out at any price (`min_sol_output = 0`): in a dumping market getting out matters more than the price, so there is no sell slippage limit. There is no stop-loss or take-profit; positions are sold after `SELL_DELAY_SLOTS`.
 
 The sell reads the real token balance on-chain and uses a fresh blockhash, retrying a few times. If the buy never landed there is nothing to sell and the position is dropped with a log line. If the Shredstream connection drops, the bot reconnects with backoff and keeps its pending sells.
 
@@ -138,20 +151,16 @@ Keys: `↑/↓` select, `s` sell the selected position, `p` pause/resume, `q` qu
 
 ```text
 src/main.rs              Pump.fun create sniper entrypoint
+src/risk.rs              Pre-buy risk checks and limits
 src/state.rs             Shared live state, events and runtime settings
 src/trader.rs            Sell execution with retries
 src/api.rs               Dashboard API (REST + WebSocket) and static UI
 src/tui.rs               Terminal dashboard (ratatui)
 ui/                      Web dashboard (Svelte + Tailwind + uPlot)
-src/copy.rs              Copy-trade shredstream listener
-src/grpc.rs              Yellowstone gRPC balance streams
 src/types.rs             Shared buy/sell amounts and tx parsers
-src/order_builder.rs     DEX-agnostic order routing
 src/pumpfun/             Pump.fun constants, ix builder, SDK
 src/pumpswap/            PumpSwap pool math, ix builder, SDK
-src/whirlpool/           Orca state, ticks, Raydium/Kamino utils
-jito_protos/             Jito protobuf + shredstream definitions
-jito_sc/                 Searcher client + SWQoS gRPC
+jito_protos/             Jito shredstream protobuf definitions
 ```
 
 ## Hire / custom sniper
@@ -162,8 +171,6 @@ This is production-style infrastructure, not a tutorial clone.
 
 - Private Pump.fun / PumpSwap snipers
 - Shredstream + Jito bundle setups
-- Copy-trade and multi-wallet execution
-- Whirlpool / Raydium / Kamino routing
 - Colocation (Cherry, Teraswitch, Latitude)
 
 GitHub: [github.com/dexoryn](https://github.com/dexoryn)

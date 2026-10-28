@@ -22,7 +22,7 @@ fn required(name: &str) -> Result<String> {
     }
 }
 
-fn optional_parsed<T: FromStr>(name: &str, default: T) -> Result<T>
+pub fn optional_parsed<T: FromStr>(name: &str, default: T) -> Result<T>
 where
     T::Err: std::fmt::Display,
 {

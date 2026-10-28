@@ -9,7 +9,6 @@ use crate::types::BuyAmounts;
 use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_sdk::instruction::AccountMeta;
 
-// use jito_searcher_client::swqos::{FeeClientTrait, JitoClient};
 use log::info;
 
 use solana_sdk::pubkey;
@@ -336,6 +335,7 @@ impl PumpFunSDK {
         blockhash: Hash,
         buy_amounts: BuyAmounts,
         creator: Pubkey,
+        slippage_percent: u64,
     ) -> PumpFunResult<(String, u64)> {
         let pump_buy_order = PumpFunBuyType {
             mint: *mint,
@@ -343,7 +343,7 @@ impl PumpFunSDK {
             user_keypair,
             blockhash,
             buy_amounts,
-            slippage: 0,
+            slippage: slippage_percent,
             cu_price: 1,
             creator,
         };

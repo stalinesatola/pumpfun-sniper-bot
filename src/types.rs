@@ -396,6 +396,23 @@ fn create_base_create_tx_pumpfun(
     })
 }
 
+/// Token name and symbol from a Pump.fun `create` instruction: after the 8-byte
+/// discriminator come borsh strings (u32 little-endian length + UTF-8 bytes).
+/// Returns `None` on anything malformed instead of panicking.
+pub fn parse_create_metadata(data: &[u8]) -> Option<(String, String)> {
+    fn read_string(data: &[u8], offset: usize) -> Option<(String, usize)> {
+        let len_end = offset.checked_add(4)?;
+        let len = u32::from_le_bytes(data.get(offset..len_end)?.try_into().ok()?) as usize;
+        let end = len_end.checked_add(len)?;
+        let text = std::str::from_utf8(data.get(len_end..end)?).ok()?;
+        Some((text.to_string(), end))
+    }
+
+    let (name, next) = read_string(data, 8)?;
+    let (symbol, _) = read_string(data, next)?;
+    Some((name, symbol))
+}
+
 impl Default for PumpFunTXInfo {
     fn default() -> Self {
         PumpFunTXInfo::new()
@@ -540,6 +557,37 @@ mod tests {
                 max_quote_amount_in: 7
             })
         );
+    }
+
+    fn borsh_string(s: &str) -> Vec<u8> {
+        let mut v = (s.len() as u32).to_le_bytes().to_vec();
+        v.extend_from_slice(s.as_bytes());
+        v
+    }
+
+    #[test]
+    fn create_metadata_is_parsed_and_malformed_data_is_rejected() {
+        let mut data = CREATE.to_vec();
+        data.extend(borsh_string("Moon Cat"));
+        data.extend(borsh_string("MCAT"));
+        data.extend(borsh_string("https://example.com/m.json"));
+        assert_eq!(
+            parse_create_metadata(&data),
+            Some(("Moon Cat".to_string(), "MCAT".to_string()))
+        );
+
+        assert_eq!(parse_create_metadata(&CREATE), None);
+        assert_eq!(parse_create_metadata(&[]), None);
+        // Length prefix larger than the remaining bytes.
+        let mut lying = CREATE.to_vec();
+        lying.extend_from_slice(&u32::MAX.to_le_bytes());
+        lying.extend_from_slice(b"abc");
+        assert_eq!(parse_create_metadata(&lying), None);
+        // Invalid UTF-8.
+        let mut bad = CREATE.to_vec();
+        bad.extend_from_slice(&2u32.to_le_bytes());
+        bad.extend_from_slice(&[0xff, 0xfe]);
+        assert_eq!(parse_create_metadata(&bad), None);
     }
 
     #[test]
