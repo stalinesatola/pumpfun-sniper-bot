@@ -4,6 +4,7 @@
 
 [![Solana](https://img.shields.io/badge/Solana-3.x-14F195?logo=solana&logoColor=white)](https://solana.com)
 [![Rust](https://img.shields.io/badge/Rust-1.89.0-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Pump.fun](https://img.shields.io/badge/Pump.fun-Sniper-00FF88)](https://pump.fun)
 [![Jito](https://img.shields.io/badge/Jito-Shredstream-FF6B00)](https://www.jito.wtf)
 [![Telegram](https://img.shields.io/badge/Telegram-bondsbtc-26A5E4?logo=telegram&logoColor=white)](https://t.me/bondsbtc)
@@ -14,7 +15,7 @@
 
 Captured from `cargo run --example demo`, which runs the real dashboard and terminal UI on **simulated** activity (no wallet, RPC or Shredstream needed). Wallet addresses and token mints are random test values.
 
-**Web dashboard** — status, wallet balance chart, live settings, risk limits, positions with *Sell now* / *Retry sell*, and the event feed (including tokens skipped by the risk checks).
+**Web dashboard** — status, wallet balance chart, live settings, risk and copy-trade limits, positions (snipes and copies) with *Sell now* / *Retry sell*, and the event feed (including tokens skipped by the risk checks).
 
 ![Web dashboard](docs/screenshots/dashboard.png)
 
@@ -37,6 +38,7 @@ This bot ingests **Jito Shredstream entries** over gRPC, deserializes shreds, an
 
 - **Pump.fun create sniper** — parse mint, creator, amounts, and blockhash from the create tx
 - **Jito Shredstream** — `ShredstreamProxy` subscribe, not Yellowstone-only logs
+- **Copy-trade** — mirror the Pump.fun buys of wallets you follow, sell when they sell
 - **Risk limits** — position / spend / drawdown caps, slippage, creator and keyword filters
 - **Dashboard** — web panel and terminal UI with live settings
 - **Pump.fun SDK** — buy / sell instruction builder + versioned transactions
@@ -122,6 +124,27 @@ Every new token is checked before a buy; a refused one shows up as `skipped` in 
 
 Sells still go out at any price (`min_sol_output = 0`): in a dumping market getting out matters more than the price, so there is no sell slippage limit. There is no stop-loss or take-profit; positions are sold after `SELL_DELAY_SLOTS`.
 
+### Copy-trade
+
+Set `COPY_WALLETS` (comma-separated addresses) and the bot also watches those wallets on the same Shredstream feed. When one of them **buys** on the Pump.fun bonding curve, the bot buys the same token with a fixed amount; when it **sells** a token you copied, the bot sells yours. Leave `COPY_WALLETS` empty to turn it off.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `COPY_WALLETS` | none (off) | Wallets to follow |
+| `COPY_BUY_SOL` | `SOL_BUY_AMOUNT` | SOL spent per copied buy, whatever the leader spent |
+| `COPY_MIN_LEADER_SOL` / `COPY_MAX_LEADER_SOL` | off | Ignore leader buys smaller / larger than this |
+| `COPY_SELL_WITH_LEADER` | `true` | Sell when the leader sells the same token |
+| `COPY_MAX_HOLD_SLOTS` | 150 | Safety exit: sell after this many slots even if the leader never sells |
+
+Copied buys go through the same checks as snipes: the [risk limits](#risk-limits), pause, and one position per token (a token you already hold, or are buying, is never bought twice). Refusals show up as `skipped` with the reason, every leader trade shows up as a `leader` event, and positions are tagged `snipe` or `copy` in the dashboard and the terminal UI.
+
+Things to know:
+- Only **Pump.fun bonding-curve** trades are copied, not PumpSwap, and only transactions whose accounts are listed directly (not through address lookup tables).
+- The leader's "size" is the SOL cap in their instruction, which includes their own slippage allowance, not necessarily what they paid.
+- Your buy lands *after* the leader's, so you pay a higher price. The price used for sizing is the leader's own maximum price; keep `BUY_SLIPPAGE_PERCENT` high enough for your buy to still land.
+- The bot refuses to start if `COPY_WALLETS` contains its own wallet.
+- Leaders can be wrong, or bait followers. Start with a small `COPY_BUY_SOL` and tight risk limits.
+
 The sell reads the real token balance on-chain and uses a fresh blockhash, retrying a few times. If the buy never landed there is nothing to sell and the position is dropped with a log line. If the Shredstream connection drops, the bot reconnects with backoff and keeps its pending sells.
 
 ## Build and run
@@ -183,12 +206,18 @@ This project started as [dexoryn](https://github.com/dexoryn)'s sniper; the cred
 - **Security** — removed every hardcoded API key and wallet secret from the code and rewrote the git history to drop them; all endpoints and keys now come from `.env`, validated at startup so a bad value fails with a clear message instead of a panic.
 - **Robustness** — Shredstream reconnects with backoff and keeps pending sells; sells use the real on-chain token balance and a fresh blockhash, retry, and a position can never be sold twice; the transaction parser no longer panics on lookup-table or truncated data; the `unwrap()`s on the trading path became proper errors.
 - **Dashboard** — a web panel (Svelte 5, Tailwind, uPlot) and a terminal UI (`ratatui`) sharing one live state, with pause, manual sell and runtime settings. The trading loop only publishes events and never waits for the UI. The API is localhost-only and token-protected.
+- **Copy-trade** — follow wallets and mirror their Pump.fun buys and sells, with the same risk checks, one position per token, and a safety exit.
 - **Risk limits** — position, spend and drawdown caps, balance reserve, creator and keyword filters, creator launch-buy range, and configurable buy slippage; every refusal is shown with its reason.
+- **Fix** — the Pump.fun buy asked for the wrong number of tokens whenever the price was not close to the launch price (it multiplied by the price instead of dividing), so the buy could fail on-chain; it now sizes from the reference buy's own price.
 - **Dependencies and tooling** — migrated to Solana SDK 3.x on Rust 1.89, with byte-for-byte golden tests of the transactions and the Shredstream entry format captured before the upgrade; known vulnerabilities in the dependency tree went from 41 to 3 (all `zstd`, upstream); unused dependencies removed; `dotenv` replaced by `dotenvy`.
-- **Cleanup and CI** — about 6,300 lines of unused code removed (copy-trade listener, Yellowstone gRPC, Whirlpool, Jito searcher client); `cargo fmt`, GitHub Actions (format, build, test, clippy, UI build, informational `cargo audit`) and Dependabot.
+- **Cleanup and CI** — about 6,300 lines of unused code removed (the old copy-trade listener, which did not compile, Yellowstone gRPC, Whirlpool, Jito searcher client); `cargo fmt`, GitHub Actions (format, build, test, clippy, UI build, informational `cargo audit`) and Dependabot.
 
 **What is and is not verified:** the unit, API, terminal-UI and golden tests pass, and the dashboards were exercised in a real browser and terminal against the demo. The bot itself has **not** been run against live Shredstream, RPC or on-chain orders by these changes — try it with a tiny `SOL_BUY_AMOUNT` first.
 
+
+## License
+
+[MIT](LICENSE).
 
 ## Disclaimer
 

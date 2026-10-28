@@ -2,6 +2,7 @@
 name = "shred_pool_cache"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [profile.release]
 # thin has minimal overhead vs none (default): https://blog.llvm.org/2016/06/thinlto-scalable-and-incremental-lto.html

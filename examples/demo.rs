@@ -8,9 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use shred_pool_cache::api::{self, ApiConfig};
+use shred_pool_cache::copy::{CopyConfig, LeaderTrade, Side};
 use shred_pool_cache::pumpfun::PumpFunSDK;
 use shred_pool_cache::pumpswap::constants::PriorityFeePump;
-use shred_pool_cache::state::{AppState, Settings};
+use shred_pool_cache::state::{AppState, PositionSource, Settings};
 use shred_pool_cache::trader::Trader;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
@@ -20,11 +21,14 @@ use solana_sdk::signer::Signer;
 async fn main() -> anyhow::Result<()> {
     let tui = std::env::args().any(|a| a == "--tui");
     let payer = Keypair::new();
-    let state = Arc::new(AppState::new(
-        payer.pubkey(),
-        Settings::new(0.001, 0.001, 7),
-    ));
-    // Nothing listens here: simulated positions fail to sell, which shows the failure paths too.
+    let leader = Pubkey::new_unique();
+    let copy = CopyConfig {
+        wallets: [leader].into_iter().collect(),
+        ..CopyConfig::default()
+    };
+    let state =
+        Arc::new(AppState::new(payer.pubkey(), Settings::new(0.001, 0.001, 7)).with_copy(copy));
+    // Nothing listens here; the demo simulates every trade itself.
     let sdk = PumpFunSDK::new(
         "http://127.0.0.1:1",
         "http://127.0.0.1:1",
@@ -79,6 +83,30 @@ async fn main() -> anyhow::Result<()> {
                         );
                         lamports = lamports.saturating_sub((sol * 1e9) as u64);
                     }
+                }
+                // A followed wallet buys now and then; we mirror it.
+                if tick % 14 == 5 && !state.settings.paused() {
+                    let mint = Pubkey::new_unique();
+                    let trade = LeaderTrade {
+                        side: Side::Buy,
+                        leader,
+                        mint,
+                        creator_vault: Pubkey::new_unique(),
+                        token_amount: 1_000_000,
+                        sol_amount: 1_500_000_000,
+                    };
+                    state.record_copy_signal(&trade, slot);
+                    state.record_buy_sent_from(
+                        &mint,
+                        &trade.creator_vault,
+                        "demo-copy-signature",
+                        0.001,
+                        slot + 12,
+                        PositionSource::Copy {
+                            leader: leader.to_string(),
+                        },
+                    );
+                    lamports = lamports.saturating_sub(1_000_000);
                 }
                 if tick % 18 == 9 {
                     state.record_skipped(
