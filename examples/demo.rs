@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(api::serve(cfg, state.clone(), trader.clone()));
 
     let sim = {
-        let (state, trader) = (state.clone(), trader.clone());
+        let state = state.clone();
         async move {
             state.set_stream_connected(true);
             let mut lamports = 2_000_000_000u64;
@@ -54,7 +54,17 @@ async fn main() -> anyhow::Result<()> {
             for tick in 0u64.. {
                 slot += 1;
                 state.set_slot(slot);
-                trader.sell_due(slot);
+                // Simulated exits: most sell, now and then one fails, so every state shows up.
+                for (n, mint) in state.due_positions(slot).into_iter().enumerate() {
+                    if state.begin_sell(&mint).is_none() {
+                        continue;
+                    }
+                    if (tick + n as u64) % 5 == 0 {
+                        state.record_sell_failed(&mint, "RPC node returned 429 Too Many Requests");
+                    } else {
+                        state.record_sell_sent(&mint, "demo-sell-signature", 1_234_567);
+                    }
+                }
                 if tick % 6 == 0 && !state.settings.paused() {
                     let (mint, creator) = (Pubkey::new_unique(), Pubkey::new_unique());
                     state.record_create(&mint, &creator, "demo-signature", slot);

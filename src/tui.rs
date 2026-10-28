@@ -103,7 +103,7 @@ fn describe(e: &Stamped) -> (Color, String) {
 
 fn draw(f: &mut Frame, snap: &Snapshot, table: &mut TableState) {
     let [header, body, footer] = Layout::vertical([
-        Constraint::Length(5),
+        Constraint::Length(6),
         Constraint::Min(6),
         Constraint::Length(1),
     ])
@@ -341,5 +341,8 @@ mod tests {
         assert!(screen.contains(&short(&mint.to_string())));
         assert!(screen.contains("held"));
         assert!(screen.contains("buy"));
+        // The risk line sits at the bottom of the header and used to be clipped.
+        assert!(screen.contains("spent 0.0010 SOL"));
+        assert!(screen.contains("drawdown"));
     }
 }

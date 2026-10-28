@@ -12,6 +12,22 @@
 
 ---
 
+## Screenshots
+
+Captured from `cargo run --example demo`, which runs the real dashboard and terminal UI on **simulated** activity (no wallet, RPC or Shredstream needed). Wallet addresses and token mints are random test values.
+
+**Web dashboard** — status, wallet balance chart, live settings, risk limits, positions with *Sell now* / *Retry sell*, and the event feed (including tokens skipped by the risk checks).
+
+![Web dashboard](docs/screenshots/dashboard.png)
+
+**Terminal UI** (`--tui`) — the same live state in the terminal.
+
+![Terminal UI](docs/screenshots/tui.png)
+
+**Login** — the API only answers to the token from your `.env`.
+
+![Login](docs/screenshots/login.png)
+
 ## Why this sniper
 
 Most public “Pump.fun snipers” wait on RPC logs or Helius webhooks. That is already late.
@@ -162,6 +178,19 @@ src/pumpfun/             Pump.fun constants, ix builder, SDK
 src/pumpswap/            PumpSwap pool math, ix builder, SDK
 jito_protos/             Jito shredstream protobuf definitions
 ```
+
+## Contributions
+
+This project started as [dexoryn](https://github.com/dexoryn)'s sniper; the credit for the original bot and its Pump.fun / PumpSwap SDKs is theirs. The changes below were added on top of it (PRs [#1](https://github.com/stalinesatola/pumpfun-sniper-bot/pull/1) and [#2](https://github.com/stalinesatola/pumpfun-sniper-bot/pull/2)), with the help of Claude Code:
+
+- **Security** — removed every hardcoded API key and wallet secret from the code and rewrote the git history to drop them; all endpoints and keys now come from `.env`, validated at startup so a bad value fails with a clear message instead of a panic.
+- **Robustness** — Shredstream reconnects with backoff and keeps pending sells; sells use the real on-chain token balance and a fresh blockhash, retry, and a position can never be sold twice; the transaction parser no longer panics on lookup-table or truncated data; the `unwrap()`s on the trading path became proper errors.
+- **Dashboard** — a web panel (Svelte 5, Tailwind, uPlot) and a terminal UI (`ratatui`) sharing one live state, with pause, manual sell and runtime settings. The trading loop only publishes events and never waits for the UI. The API is localhost-only and token-protected.
+- **Risk limits** — position, spend and drawdown caps, balance reserve, creator and keyword filters, creator launch-buy range, and configurable buy slippage; every refusal is shown with its reason.
+- **Dependencies and tooling** — migrated to Solana SDK 3.x on Rust 1.89, with byte-for-byte golden tests of the transactions and the Shredstream entry format captured before the upgrade; known vulnerabilities in the dependency tree went from 41 to 3 (all `zstd`, upstream); unused dependencies removed; `dotenv` replaced by `dotenvy`.
+- **Cleanup and CI** — about 6,300 lines of unused code removed (copy-trade listener, Yellowstone gRPC, Whirlpool, Jito searcher client); `cargo fmt`, GitHub Actions (format, build, test, clippy, UI build, informational `cargo audit`) and Dependabot.
+
+**What is and is not verified:** the unit, API, terminal-UI and golden tests pass, and the dashboards were exercised in a real browser and terminal against the demo. The bot itself has **not** been run against live Shredstream, RPC or on-chain orders by these changes — try it with a tiny `SOL_BUY_AMOUNT` first.
 
 ## Hire / custom sniper
 
