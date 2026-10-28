@@ -14,7 +14,7 @@ use solana_sdk::message::Message;
 use spl_associated_token_account::get_associated_token_address;
 use std::{str::FromStr, sync::Arc};
 
-use rustls::crypto::{CryptoProvider, ring::default_provider};
+use rustls::crypto::{ring::default_provider, CryptoProvider};
 
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::hash::Hash;

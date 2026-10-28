@@ -3,8 +3,8 @@ pub mod config;
 pub mod pumpfun;
 pub mod pumpswap;
 pub mod risk;
-pub mod types;
 pub mod state;
 pub mod trader;
 #[cfg(feature = "tui")]
 pub mod tui;
+pub mod types;

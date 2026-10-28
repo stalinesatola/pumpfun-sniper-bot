@@ -71,7 +71,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 if tick % 18 == 9 {
-                    state.record_skipped(&Pubkey::new_unique(), "creator buy 9.000 SOL is above the maximum 5");
+                    state.record_skipped(
+                        &Pubkey::new_unique(),
+                        "creator buy 9.000 SOL is above the maximum 5",
+                    );
                 }
                 if tick % 20 == 0 {
                     state.record_balance(lamports);
