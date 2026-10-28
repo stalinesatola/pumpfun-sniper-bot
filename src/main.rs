@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use env_logger::Env;
 use jito_protos::shredstream::{
     shredstream_proxy_client::ShredstreamProxyClient, SubscribeEntriesRequest,
