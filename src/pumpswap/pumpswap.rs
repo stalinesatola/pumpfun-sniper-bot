@@ -163,7 +163,7 @@ impl PumpSwapSDK {
         // Create compute budget instructions
         let mut compute_unit_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(150_000);
         let jitodontfront = AccountMeta {
-            pubkey: Pubkey::from_str("jitodontfront11111111111111111ButMyNiggasDo").unwrap(),
+            pubkey: Pubkey::from_str("jitodontfront111111111111111111111111111111").unwrap(),
             is_signer: false,
             is_writable: false,
         };
@@ -263,7 +263,7 @@ impl PumpSwapSDK {
         // Create compute budget instructions
         let mut compute_unit_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(150_000);
         let jitodontfront = AccountMeta {
-            pubkey: Pubkey::from_str("jitodontfront11111111111111111ButMyNiggasDo").unwrap(),
+            pubkey: Pubkey::from_str("jitodontfront111111111111111111111111111111").unwrap(),
             is_signer: false,
             is_writable: false,
         };

@@ -38,6 +38,10 @@ async fn main() -> anyhow::Result<()> {
         state = state.with_rules_store(path.into());
     }
     let state = Arc::new(state);
+    // Like the real bot, the demo starts paused (START_PAUSED=false to start running).
+    if std::env::var("START_PAUSED").map_or(true, |v| v != "false") {
+        state.set_paused(true);
+    }
     // Nothing listens here; the demo simulates every trade itself.
     let sdk = PumpFunSDK::new(
         "http://127.0.0.1:1",

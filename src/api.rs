@@ -143,6 +143,33 @@ pub fn router(app: Arc<AppState>, trader: Trader, token: String, ui_dir: PathBuf
         .with_state(state)
 }
 
+/// True when something in `ui/src` (next to the build folder) is newer than the build, i.e.
+/// the dashboard being served was built before the latest UI changes.
+pub fn ui_build_is_stale(ui_dir: &std::path::Path) -> bool {
+    fn newest(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+        let mut best = None;
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            let t = if path.is_dir() {
+                newest(&path)
+            } else {
+                entry.metadata().ok()?.modified().ok()
+            };
+            best = best.max(t);
+        }
+        best
+    }
+    let built = ui_dir
+        .join("index.html")
+        .metadata()
+        .and_then(|m| m.modified());
+    let src = ui_dir
+        .parent()
+        .map(|p| p.join("src"))
+        .and_then(|d| newest(&d));
+    matches!((built, src), (Ok(b), Some(s)) if s > b)
+}
+
 pub async fn serve(cfg: ApiConfig, app: Arc<AppState>, trader: Trader) -> Result<()> {
     if !cfg.bind.ip().is_loopback() {
         warn!("API listens on {} which is not loopback: anyone who can reach it and has the token controls the bot", cfg.bind);
@@ -150,6 +177,11 @@ pub async fn serve(cfg: ApiConfig, app: Arc<AppState>, trader: Trader) -> Result
     if !cfg.ui_dir.join("index.html").exists() {
         warn!(
             "No UI build at {} (run `npm run build` in ui/); the API still works",
+            cfg.ui_dir.display()
+        );
+    } else if ui_build_is_stale(&cfg.ui_dir) {
+        warn!(
+            "The UI build in {} is older than the sources in ui/src: the dashboard will miss newer features (copy-trade switch, trading mode, ...). Run `npm run build` in ui/ and reload",
             cfg.ui_dir.display()
         );
     }
@@ -308,6 +340,25 @@ async fn ws_loop(mut socket: WebSocket, app: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ui_build_older_than_its_sources_is_stale() {
+        let root = std::env::temp_dir().join(format!("sniper-ui-{}", std::process::id()));
+        let (dist, src) = (root.join("dist"), root.join("src"));
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::create_dir_all(src.join("lib")).unwrap();
+        std::fs::write(dist.join("index.html"), "x").unwrap();
+        assert!(!ui_build_is_stale(&dist), "no sources newer than the build");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(src.join("lib/new.svelte"), "y").unwrap();
+        assert!(
+            ui_build_is_stale(&dist),
+            "a newer source file makes it stale"
+        );
+        // No build or no sources next to it: nothing to warn about.
+        assert!(!ui_build_is_stale(&root.join("missing")));
+        let _ = std::fs::remove_dir_all(root);
+    }
     use crate::pumpfun::PumpFunSDK;
     use crate::pumpswap::constants::PriorityFeePump;
     use crate::state::Settings;

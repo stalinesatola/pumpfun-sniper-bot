@@ -26,7 +26,7 @@ use std::sync::Arc;
 const ASTRALANE_TIP: Pubkey = pubkey!("astra4uejePWneqNaJKuFFA8oonqCE1sqF6b45kDMZm");
 /// Read-only marker account that keeps Jito bundles from placing the transaction after a
 /// front-running one ("don't front").
-const JITO_DONT_FRONT: Pubkey = pubkey!("jitodontfront11111111111111111ButMyNiggasDo");
+const JITO_DONT_FRONT: Pubkey = pubkey!("jitodontfront111111111111111111111111111111");
 
 /// The part of the transaction both directions share: compute budget, with the priority fee.
 fn compute_budget() -> Vec<Instruction> {
