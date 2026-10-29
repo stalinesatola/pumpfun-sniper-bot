@@ -61,11 +61,66 @@ impl ApiConfig {
             bind,
             token,
             token_generated,
-            ui_dir: PathBuf::from(
-                env::var("UI_DIR").unwrap_or_else(|_| DEFAULT_UI_DIR.to_string()),
+            ui_dir: resolve_ui_dir(
+                env::var("UI_DIR").ok().as_deref(),
+                &std::env::current_dir().unwrap_or_default(),
+                std::env::current_exe().ok().as_deref(),
+                Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))),
             ),
         }))
     }
+}
+
+/// Where the dashboard build is. `UI_DIR` wins; otherwise the first of `ui/dist` in the
+/// current folder, next to the executable's project (`target/release/..`) and in the folder
+/// the program was built from that actually holds a build. This way it works even when the
+/// bot is started from another folder (e.g. from inside `ui/`).
+pub fn resolve_ui_dir(
+    configured: Option<&str>,
+    cwd: &std::path::Path,
+    exe: Option<&std::path::Path>,
+    manifest: Option<&std::path::Path>,
+) -> PathBuf {
+    if let Some(dir) = configured.map(str::trim).filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    let mut candidates = vec![cwd.join(DEFAULT_UI_DIR)];
+    if let Some(root) = exe
+        .and_then(|e| e.parent()) // target/release
+        .and_then(|p| p.parent()) // target
+        .and_then(|p| p.parent())
+    {
+        candidates.push(root.join(DEFAULT_UI_DIR));
+    }
+    if let Some(m) = manifest {
+        candidates.push(m.join(DEFAULT_UI_DIR));
+    }
+    // With no build anywhere, point at the project folder the program was built from, so a
+    // build made later is found without a restart, whichever folder the bot runs in.
+    let fallback =
+        manifest.map_or_else(|| PathBuf::from(DEFAULT_UI_DIR), |m| m.join(DEFAULT_UI_DIR));
+    candidates
+        .into_iter()
+        .find(|d| d.join("index.html").exists())
+        .unwrap_or(fallback)
+}
+
+/// Shown instead of a blank 404 when the dashboard has not been built.
+async fn ui_help() -> axum::response::Html<&'static str> {
+    axum::response::Html(
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>\
+         <title>Sniper</title><body style='font-family:system-ui;max-width:42rem;margin:3rem auto;padding:0 1rem'>\
+         <h1>The bot is running, but the dashboard is not built</h1>\
+         <p>In the project folder run:</p>\
+         <pre>cd ui\nnpm install\nnpm run build\ncd ..</pre>\
+         <p>then reload this page (no restart needed). Start the bot from the project folder.</p>\
+         <!-- padding so that browsers show this page instead of their own error page for a 404: \
+              .................................................................................... \
+              .................................................................................... \
+              .................................................................................... \
+              .................................................................................... \
+              .................................................................................... -->",
+    )
 }
 
 fn random_token() -> String {
@@ -139,7 +194,7 @@ pub fn router(app: Arc<AppState>, trader: Trader, token: String, ui_dir: PathBuf
     // The page itself is static and public; everything that reads or changes the bot needs the token.
     Router::new()
         .merge(protected)
-        .fallback_service(ServeDir::new(ui_dir))
+        .fallback_service(ServeDir::new(ui_dir).not_found_service(get(ui_help)))
         .with_state(state)
 }
 
@@ -342,6 +397,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_ui_folder_is_found_from_where_the_bot_was_started() {
+        let root = std::env::temp_dir().join(format!("sniper-uidir-{}", std::process::id()));
+        let (project, elsewhere) = (root.join("project"), root.join("project/ui"));
+        std::fs::create_dir_all(project.join("ui/dist")).unwrap();
+        std::fs::write(project.join("ui/dist/index.html"), "x").unwrap();
+        let exe = project.join("target/release/shred_pool_cache");
+
+        // Started from the project root.
+        assert_eq!(
+            resolve_ui_dir(None, &project, None, None),
+            project.join("ui/dist")
+        );
+        // Started from inside ui/: found through the executable's project.
+        assert_eq!(
+            resolve_ui_dir(None, &elsewhere, Some(&exe), None),
+            project.join("ui/dist")
+        );
+        // ...or through the folder it was built from.
+        assert_eq!(
+            resolve_ui_dir(None, &root, None, Some(&project)),
+            project.join("ui/dist")
+        );
+        // UI_DIR always wins; with no build anywhere the default is kept (and warned about).
+        assert_eq!(
+            resolve_ui_dir(Some(" custom "), &project, None, None),
+            PathBuf::from("custom")
+        );
+        assert_eq!(
+            resolve_ui_dir(None, &root, None, None),
+            PathBuf::from("ui/dist")
+        );
+        // No build yet but the project folder is known: that is where it will appear.
+        assert_eq!(
+            resolve_ui_dir(None, &root, None, Some(&root)),
+            root.join("ui/dist")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_ui_build_older_than_its_sources_is_stale() {
         let root = std::env::temp_dir().join(format!("sniper-ui-{}", std::process::id()));
         let (dist, src) = (root.join("dist"), root.join("src"));
@@ -401,6 +496,24 @@ mod tests {
             b = b.header("authorization", format!("Bearer {t}"));
         }
         b.body(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn without_a_ui_build_the_page_explains_how_to_build_it() {
+        let (app, _) = app().await; // its ui_dir does not exist
+        let res = app
+            .oneshot(req("GET", "/", None, Body::empty()))
+            .await
+            .unwrap();
+        // The status stays 404 (nothing is served), but the body explains what to do and is long
+        // enough for browsers to show it.
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let page = String::from_utf8_lossy(&bytes);
+        assert!(page.contains("npm run build"), "{page}");
+        assert!(bytes.len() > 512, "{} bytes", bytes.len());
     }
 
     #[test]
