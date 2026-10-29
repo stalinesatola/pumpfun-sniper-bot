@@ -2,6 +2,8 @@ pub mod api;
 pub mod community;
 pub mod config;
 pub mod copy;
+pub mod costs;
+pub mod persist;
 pub mod pumpfun;
 pub mod pumpswap;
 pub mod risk;

@@ -42,6 +42,7 @@ async function call(path, method = 'POST', body) {
 export const saveSettings = (s) => call('/api/settings', 'POST', s);
 export const setPaused = (paused) => call('/api/pause', 'POST', { paused });
 export const sellNow = (mint) => call(`/api/sell/${mint}`);
+export const setMode = (mode) => call('/api/mode', 'POST', { mode });
 export const setCopyEnabled = (enabled) => call('/api/copy', 'POST', { enabled });
 export const addCopyWallet = (address) => call('/api/copy/wallets', 'POST', { address });
 export const removeCopyWallet = (address) => call(`/api/copy/wallets/${encodeURIComponent(address)}`, 'DELETE');

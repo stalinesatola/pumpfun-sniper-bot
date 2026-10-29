@@ -92,6 +92,13 @@ async fn main() -> Result<()> {
     };
     let sdk = PumpFunSDK::new(&config.rpc_url, &config.astralane_url, priority_fee).await;
 
+    // Where the trading mode is saved ("off" = do not save).
+    let rules_store = match env::var("RULES_STATE_FILE") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("off") => None,
+        Ok(v) if !v.trim().is_empty() => Some(PathBuf::from(v.trim())),
+        _ => Some(PathBuf::from("rules.json")),
+    };
+
     let state = Arc::new(AppState::configured(
         config.payer.pubkey(),
         Settings::from_config(&config),
@@ -99,6 +106,7 @@ async fn main() -> Result<()> {
         copy_config,
         community_config,
         copy_store,
+        rules_store,
     ));
     log_configuration(&config, &state);
     let trader = Trader::new(sdk, config.payer.insecure_clone(), state.clone());
@@ -177,12 +185,20 @@ async fn refresh_balance(trader: Trader) {
 /// Logs the configuration the bot is actually running with, read back from the state.
 fn log_configuration(config: &Config, state: &AppState) {
     info!(
-        "Wallet {} | buy {} SOL | tip {} SOL | sell after {} slots",
+        "Wallet {} | buy {} SOL | tip {} SOL | sell after {} slots | mode {:?}",
         config.payer.pubkey(),
         state.settings.buy_amount_sol(),
         state.settings.bribe_fee_sol(),
-        state.settings.sell_delay_slots()
+        state.settings.sell_delay_slots(),
+        state.settings.mode()
     );
+    let view = state.settings.view();
+    if view.cost_pct_of_buy > shred_pool_cache::costs::HIGH_COST_PCT {
+        warn!(
+            "Fees per buy+sell are about {:.5} SOL, {:.0}% of the {} SOL bought: a trade needs to gain more than that just to break even. Raise SOL_BUY_AMOUNT or lower BRIBE_FEE.",
+            view.round_trip_cost_sol, view.cost_pct_of_buy, view.buy_amount_sol
+        );
+    }
     let c = &state.community.config;
     if c.require_community {
         info!(

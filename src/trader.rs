@@ -101,6 +101,10 @@ impl Trader {
     /// Sells every held position whose sell slot has been reached. Each sell runs in its
     /// own task, so slow RPC calls never stall the caller (the shredstream loop).
     pub fn sell_due(&self, slot: u64) {
+        // Buy-only: positions stay held. They become due again as soon as the mode changes.
+        if !self.state.settings.mode().allows_sells() {
+            return;
+        }
         for mint in self.state.due_positions(slot) {
             // Losing the claim just means another sell got there first.
             let _ = self.sell_now(&mint);
@@ -184,5 +188,52 @@ impl Trader {
             mint
         );
         self.state.record_sell_failed(&mint, &last_error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pumpswap::constants::PriorityFeePump;
+    use crate::state::{PositionStatus, Settings, TradingMode};
+
+    async fn trader() -> Trader {
+        let payer = Keypair::new();
+        let state = Arc::new(AppState::new(
+            payer.pubkey(),
+            Settings::new(0.001, 0.001, 7),
+        ));
+        let sdk = PumpFunSDK::new(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            PriorityFeePump::default(),
+        )
+        .await;
+        Trader::new(sdk, payer, state)
+    }
+
+    #[tokio::test]
+    async fn buy_only_never_sells_on_its_own_but_a_manual_sell_still_works() {
+        let t = trader().await;
+        let mint = Pubkey::new_unique();
+        t.state
+            .record_buy_sent(&mint, &Pubkey::new_unique(), "sig", 0.001, 10);
+        let status = || t.state.snapshot().positions[0].status;
+
+        t.state.set_mode(TradingMode::BuyOnly);
+        t.sell_due(1_000);
+        assert_eq!(status(), PositionStatus::Held, "the timer must not sell");
+
+        // Back to a mode that sells: the position is due immediately.
+        t.state.set_mode(TradingMode::BuyAndSell);
+        t.sell_due(1_000);
+        assert_ne!(status(), PositionStatus::Held);
+
+        // A manual sell works even in buy-only.
+        let t2 = trader().await;
+        t2.state
+            .record_buy_sent(&mint, &Pubkey::new_unique(), "sig", 0.001, 10_000);
+        t2.state.set_mode(TradingMode::BuyOnly);
+        assert!(t2.sell_now(&mint).is_ok());
     }
 }

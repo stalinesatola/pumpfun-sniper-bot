@@ -39,6 +39,7 @@ This bot ingests **Jito Shredstream entries** over gRPC, deserializes shreds, an
 - **Pump.fun create sniper** — parse mint, creator, amounts, and blockhash from the create tx
 - **Jito Shredstream** — `ShredstreamProxy` subscribe, not Yellowstone-only logs
 - **New coins with an active community** — only buys tokens created live, and only after enough different wallets bought them
+- **Trading mode** — buy only, buy & sell or sell only, switchable from the dashboard, plus a fee estimate per round trip
 - **Copy-trade** — mirror the Pump.fun buys of wallets you follow, sell when they sell
 - **Risk limits** — position / spend / drawdown caps, slippage, creator and keyword filters
 - **Dashboard** — web panel and terminal UI with live settings
@@ -149,6 +150,20 @@ What this does and does not tell you:
 - The SOL amounts are what buyers were *willing* to pay (the cap in their instruction), not what they paid.
 - It is on-chain activity only: one person with many wallets can fake unique buyers, and it does not look at Twitter, Telegram or the token page. It filters out launches nobody is buying; it does not prove the community is real.
 
+### Trading mode and fees
+
+A selector at the top of the dashboard (and `m` in the terminal UI) sets what the bot may do on its own, for the whole bot (the sniper and copy-trade):
+
+| Mode | New positions | Automatic sells |
+| --- | --- | --- |
+| **Buy only** | yes | **no**: nothing sells by itself (no timer, no leader sells) |
+| **Buy & sell** (default) | yes | yes |
+| **Sell only** | **no**: every buy is refused and shown as `skipped` | yes |
+
+A **manual** sell (*Sell now*, or `s` in the terminal UI) always works. Positions held in buy-only mode are sold as soon as you switch back to a mode that sells. The mode is saved to `rules.json` (`RULES_STATE_FILE`, `off` = memory only), so it survives a restart.
+
+**Fees decide whether you can win.** Every transaction pays the landing tip (`BRIBE_FEE`), a priority fee (about 0.00015 SOL) and the network fee, and a round trip is two transactions. The dashboard shows the fees of one buy + sell and turns red above 20% of the buy. With `SOL_BUY_AMOUNT=0.001` and `BRIBE_FEE=0.001` a round trip costs about 0.0023 SOL, more than twice the stake: the token has to gain over 200% just to break even. Use a larger buy or a smaller tip. (The token account's rent, about 0.002 SOL, is refunded when the position is closed.)
+
 ### Copy-trade
 
 Copy-trade has an **on/off switch and a wallet list you edit in the dashboard** (the *Copy-trade* card: *Turn on / Turn off*, a field to add an address, *Remove* per wallet). Changes apply immediately, no restart. In the terminal UI, `c` switches it on and off.
@@ -210,7 +225,7 @@ Customising the look: colours and fonts are tokens at the top of `ui/src/app.css
 cargo run --release -- --tui
 ```
 
-Keys: `↑/↓` select, `s` sell the selected position, `p` pause/resume, `c` copy-trade on/off, `q` quit. Logs go to `sniper.log` while the TUI is open. Build without it using `--no-default-features`.
+Keys: `↑/↓` select, `s` sell the selected position, `p` pause/resume, `m` cycle the trading mode, `c` copy-trade on/off, `q` quit. Logs go to `sniper.log` while the TUI is open. Build without it using `--no-default-features`.
 
 **Try it without a wallet:** `cargo run --example demo` (add `-- --tui`) runs both interfaces on simulated activity.
 
@@ -237,6 +252,7 @@ This project started as [dexoryn](https://github.com/dexoryn)'s sniper; the cred
 - **Security** — removed every hardcoded API key and wallet secret from the code and rewrote the git history to drop them; all endpoints and keys now come from `.env`, validated at startup so a bad value fails with a clear message instead of a panic.
 - **Robustness** — Shredstream reconnects with backoff and keeps pending sells; sells use the real on-chain token balance and a fresh blockhash, retry, and a position can never be sold twice; the transaction parser no longer panics on lookup-table or truncated data; the `unwrap()`s on the trading path became proper errors.
 - **Dashboard** — a web panel (Svelte 5, Tailwind, uPlot) and a terminal UI (`ratatui`) sharing one live state, with pause, manual sell and runtime settings. The trading loop only publishes events and never waits for the UI. The API is localhost-only and token-protected.
+- **Trading mode and fee estimate** — switch between buy only, buy & sell and sell only from the dashboard; the dashboard warns when fees eat the stake.
 - **Buy rule** — only new coins, and only once they show an active community (unique buyers and SOL bid within a short window); copy-trade follows the same rule.
 - **Copy-trade** — follow wallets and mirror their Pump.fun buys and sells, with the same risk checks, one position per token, and a safety exit; switch it on/off and edit the followed wallets from the dashboard, with the list saved across restarts.
 - **Risk limits** — position, spend and drawdown caps, balance reserve, creator and keyword filters, creator launch-buy range, and configurable buy slippage; every refusal is shown with its reason.

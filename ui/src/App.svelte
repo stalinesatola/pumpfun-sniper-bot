@@ -1,6 +1,6 @@
 <script>
   import {
-    bot, login, logout, saveSettings, setPaused, sellNow,
+    bot, login, logout, saveSettings, setPaused, sellNow, setMode,
     setCopyEnabled, addCopyWallet, removeCopyWallet,
   } from './lib.svelte.js';
   import Chart from './Chart.svelte';
@@ -28,6 +28,12 @@
       };
     }
   });
+
+  const modes = [
+    ['buy_only', 'Buy only', 'Opens positions, never sells by itself'],
+    ['buy_and_sell', 'Buy & sell', 'Normal operation'],
+    ['sell_only', 'Sell only', 'Opens nothing new, only sells what is held'],
+  ];
 
   const addWallet = () =>
     guarded(async () => {
@@ -120,6 +126,17 @@
       {/if}
       <span class="text-dim">creates seen <span class="num text-ink">{bot.createsSeen}</span></span>
       <span class="num text-dim" title={snap.wallet}>{short(snap.wallet)}</span>
+      <div class="flex overflow-hidden rounded border border-line" role="group" aria-label="Trading mode">
+        {#each modes as [value, label, hint]}
+          <button
+            title={hint}
+            class="px-3 py-1 text-sm {snap.settings.mode === value ? 'bg-accent font-medium text-bg' : 'text-dim hover:text-ink'}"
+            onclick={() => guarded(() => setMode(value))}
+          >
+            {label}
+          </button>
+        {/each}
+      </div>
       <span class="ml-auto flex items-center gap-3">
         {#if !bot.online}<span class="text-warn">reconnecting…</span>{/if}
         <button class="rounded border border-line px-3 py-1 hover:border-warn" onclick={() => guarded(() => setPaused(!snap.settings.paused))}>
@@ -152,6 +169,16 @@
             />
           </label>
         {/each}
+        <p class="text-xs {snap.settings.cost_pct_of_buy > 20 ? 'text-bad' : 'text-dim'}">
+          Fees for one buy + sell: about {snap.settings.round_trip_cost_sol.toFixed(5)} SOL
+          ({snap.settings.cost_pct_of_buy.toFixed(0)}% of the buy).
+          {#if snap.settings.cost_pct_of_buy > 20}
+            A trade must gain more than that just to break even: raise the buy amount or lower the tip.
+          {/if}
+        </p>
+        {#if snap.settings.save_error}
+          <p class="text-xs text-bad">Mode is active but {snap.settings.save_error}.</p>
+        {/if}
         <button class="w-full rounded bg-accent px-3 py-2 font-medium text-bg hover:opacity-90 disabled:opacity-40" disabled={!formDirty}>
           Apply
         </button>

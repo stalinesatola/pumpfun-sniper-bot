@@ -1,8 +1,9 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use log::warn;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use tokio::sync::broadcast;
@@ -10,6 +11,8 @@ use tokio::sync::broadcast;
 use crate::community::{CommunityConfig, CommunityTracker, CommunityView};
 use crate::config::{positive_sol, Config};
 use crate::copy::{CopyConfig, CopyFollow, CopyView, LeaderTrade, Side};
+use crate::costs;
+use crate::persist::{self, Loaded};
 use crate::risk::{lamports_to_sol, Exposure, RiskConfig, RiskView};
 
 const MAX_RECENT_EVENTS: usize = 200;
@@ -150,8 +153,61 @@ pub struct Position {
     pub error: Option<String>,
 }
 
+/// What the bot may do on its own. A manual sell from the dashboard always works.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TradingMode {
+    /// Opens positions but never sells by itself (no timer, no leader sells).
+    BuyOnly,
+    #[default]
+    BuyAndSell,
+    /// Opens nothing new; only manages (sells) the positions that already exist.
+    SellOnly,
+}
+
+impl TradingMode {
+    pub fn allows_buys(self) -> bool {
+        !matches!(self, TradingMode::SellOnly)
+    }
+
+    pub fn allows_sells(self) -> bool {
+        !matches!(self, TradingMode::BuyOnly)
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            TradingMode::BuyOnly => 0,
+            TradingMode::BuyAndSell => 1,
+            TradingMode::SellOnly => 2,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => TradingMode::BuyOnly,
+            2 => TradingMode::SellOnly,
+            _ => TradingMode::BuyAndSell,
+        }
+    }
+
+    /// Why a buy was refused, for the event feed.
+    pub const BUY_REFUSED: &'static str = "mode is sell-only: not opening new positions";
+    /// Why an automatic sell was held back.
+    pub const SELL_REFUSED: &'static str = "mode is buy-only: not selling automatically";
+}
+
+/// What is saved between runs (more settings join this file over time, hence the defaults).
+#[derive(Serialize, Deserialize, Default)]
+struct SavedRules {
+    #[serde(default)]
+    mode: TradingMode,
+}
+
 /// Values the operator may change while the bot runs.
 pub struct Settings {
+    mode: AtomicU8,
+    store: Option<std::path::PathBuf>,
+    save_error: Mutex<Option<String>>,
     buy_amount_sol: AtomicU64,
     bribe_fee_sol: AtomicU64,
     sell_delay_slots: AtomicU64,
@@ -164,6 +220,12 @@ pub struct SettingsView {
     pub bribe_fee_sol: f64,
     pub sell_delay_slots: u64,
     pub paused: bool,
+    pub mode: TradingMode,
+    /// Fees of one buy + sell with the current tip, in SOL, and as a share of the buy.
+    pub round_trip_cost_sol: f64,
+    pub cost_pct_of_buy: f64,
+    /// Set when the last attempt to save the mode failed (the change is still in effect).
+    pub save_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -176,6 +238,9 @@ pub struct SettingsUpdate {
 impl Settings {
     pub fn new(buy_amount_sol: f64, bribe_fee_sol: f64, sell_delay_slots: u64) -> Self {
         Self {
+            mode: AtomicU8::new(TradingMode::default().to_u8()),
+            store: None,
+            save_error: Mutex::new(None),
             buy_amount_sol: AtomicU64::new(buy_amount_sol.to_bits()),
             bribe_fee_sol: AtomicU64::new(bribe_fee_sol.to_bits()),
             sell_delay_slots: AtomicU64::new(sell_delay_slots),
@@ -207,12 +272,62 @@ impl Settings {
         self.paused.load(Ordering::Relaxed)
     }
 
+    pub fn mode(&self) -> TradingMode {
+        TradingMode::from_u8(self.mode.load(Ordering::Relaxed))
+    }
+
+    pub fn set_mode(&self, mode: TradingMode) {
+        self.mode.store(mode.to_u8(), Ordering::Relaxed);
+        self.save();
+    }
+
+    /// Keeps the mode in `path` so it survives a restart. An existing file replaces the
+    /// current mode; one that cannot be read is ignored.
+    pub fn attach_store(&mut self, path: std::path::PathBuf) {
+        match persist::read_json::<SavedRules>(&path) {
+            Loaded::Value(saved) => self.mode.store(saved.mode.to_u8(), Ordering::Relaxed),
+            Loaded::Missing => {}
+            Loaded::Unreadable(e) => {
+                warn!("Could not read {}: {e}; using the defaults", path.display())
+            }
+        }
+        self.store = Some(path);
+    }
+
+    pub fn persisted(&self) -> bool {
+        self.store.is_some()
+    }
+
+    fn save(&self) {
+        let Some(path) = &self.store else {
+            return;
+        };
+        let saved = SavedRules { mode: self.mode() };
+        let error = match persist::write_json(path, &saved) {
+            Ok(()) => None,
+            Err(e) => {
+                warn!("Could not save {}: {e}", path.display());
+                Some(format!("could not save {}: {e}", path.display()))
+            }
+        };
+        *self.save_error.lock().unwrap_or_else(|e| e.into_inner()) = error;
+    }
+
     pub fn view(&self) -> SettingsView {
+        let (buy, tip) = (self.buy_amount_sol(), self.bribe_fee_sol());
         SettingsView {
-            buy_amount_sol: self.buy_amount_sol(),
-            bribe_fee_sol: self.bribe_fee_sol(),
+            buy_amount_sol: buy,
+            bribe_fee_sol: tip,
             sell_delay_slots: self.sell_delay_slots(),
             paused: self.paused(),
+            mode: self.mode(),
+            round_trip_cost_sol: costs::round_trip_cost_sol(tip),
+            cost_pct_of_buy: costs::cost_pct_of_buy(buy, tip),
+            save_error: self
+                .save_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
         }
     }
 
@@ -333,13 +448,18 @@ impl AppState {
         copy: CopyConfig,
         community: CommunityConfig,
         copy_store: Option<std::path::PathBuf>,
+        rules_store: Option<std::path::PathBuf>,
     ) -> Self {
         let state = Self::new(wallet, settings)
             .with_risk(risk)
             .with_community(community)
             .with_copy(copy);
-        match copy_store {
+        let state = match copy_store {
             Some(path) => state.with_copy_store(path),
+            None => state,
+        };
+        match rules_store {
+            Some(path) => state.with_rules_store(path),
             None => state,
         }
     }
@@ -347,6 +467,21 @@ impl AppState {
     pub fn with_risk(mut self, risk: RiskConfig) -> Self {
         self.risk = risk;
         self
+    }
+
+    /// Saves the trading mode to `path` (see [`Settings::attach_store`]).
+    pub fn with_rules_store(mut self, path: std::path::PathBuf) -> Self {
+        self.settings.attach_store(path);
+        self
+    }
+
+    pub fn set_mode(&self, mode: TradingMode) -> SettingsView {
+        self.settings.set_mode(mode);
+        let view = self.settings.view();
+        self.publish(Event::SettingsChanged {
+            settings: view.clone(),
+        });
+        view
     }
 
     pub fn with_community(mut self, config: CommunityConfig) -> Self {
@@ -976,6 +1111,7 @@ mod tests {
             copy,
             community,
             None,
+            None,
         );
 
         let snap = state.snapshot();
@@ -1022,5 +1158,82 @@ mod tests {
         let json = serde_json::to_value(&st.snapshot().recent.last().unwrap().event).unwrap();
         assert_eq!(json["type"], "copy_changed");
         assert_eq!(json["copy"]["enabled"], false);
+    }
+
+    #[test]
+    fn trading_modes_allow_the_right_things() {
+        use TradingMode::*;
+        assert!(BuyOnly.allows_buys() && !BuyOnly.allows_sells());
+        assert!(BuyAndSell.allows_buys() && BuyAndSell.allows_sells());
+        assert!(!SellOnly.allows_buys() && SellOnly.allows_sells());
+        assert_eq!(TradingMode::default(), BuyAndSell);
+        assert_eq!(serde_json::to_string(&BuyOnly).unwrap(), "\"buy_only\"");
+        assert_eq!(
+            serde_json::from_str::<TradingMode>("\"sell_only\"").unwrap(),
+            SellOnly
+        );
+        assert!(serde_json::from_str::<TradingMode>("\"both\"").is_err());
+    }
+
+    #[test]
+    fn the_mode_is_published_saved_and_restored() {
+        let dir = std::env::temp_dir().join(format!("sniper-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rules.json");
+        let _ = std::fs::remove_file(&path);
+
+        let st = AppState::new(Pubkey::new_unique(), Settings::new(0.001, 0.001, 7))
+            .with_rules_store(path.clone());
+        let mut rx = st.subscribe();
+        assert_eq!(st.settings.mode(), TradingMode::BuyAndSell);
+        assert!(st.settings.persisted());
+
+        let view = st.set_mode(TradingMode::SellOnly);
+        assert_eq!(view.mode, TradingMode::SellOnly);
+        assert!(matches!(
+            rx.try_recv().unwrap().event,
+            Event::SettingsChanged { settings } if settings.mode == TradingMode::SellOnly
+        ));
+        assert_eq!(st.snapshot().settings.mode, TradingMode::SellOnly);
+
+        // "Restart": a fresh state with the same file starts in the saved mode.
+        let again = AppState::new(Pubkey::new_unique(), Settings::new(0.001, 0.001, 7))
+            .with_rules_store(path.clone());
+        assert_eq!(again.settings.mode(), TradingMode::SellOnly);
+
+        // A corrupt file is ignored (the default mode is kept) and replaced on the next change.
+        std::fs::write(&path, "{ not json").unwrap();
+        let broken = AppState::new(Pubkey::new_unique(), Settings::new(0.001, 0.001, 7))
+            .with_rules_store(path.clone());
+        assert_eq!(broken.settings.mode(), TradingMode::BuyAndSell);
+        broken.set_mode(TradingMode::BuyOnly);
+        let fixed = AppState::new(Pubkey::new_unique(), Settings::new(0.001, 0.001, 7))
+            .with_rules_store(path.clone());
+        assert_eq!(fixed.settings.mode(), TradingMode::BuyOnly);
+
+        // An unwritable path keeps the change in memory and reports the error.
+        let unwritable = AppState::new(Pubkey::new_unique(), Settings::new(0.001, 0.001, 7))
+            .with_rules_store(std::path::PathBuf::from(
+                "/nonexistent-dir-for-test/rules.json",
+            ));
+        let view = unwritable.set_mode(TradingMode::SellOnly);
+        assert_eq!(view.mode, TradingMode::SellOnly);
+        assert!(view.save_error.unwrap().contains("could not save"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_settings_view_carries_the_fee_estimate() {
+        let st = AppState::new(Pubkey::new_unique(), Settings::new(0.001, 0.001, 7));
+        let v = st.snapshot().settings;
+        assert!((v.round_trip_cost_sol - 0.00231).abs() < 1e-9);
+        assert!(v.cost_pct_of_buy > crate::costs::HIGH_COST_PCT);
+        st.update_settings(&SettingsUpdate {
+            buy_amount_sol: Some(0.1),
+            bribe_fee_sol: Some(0.0001),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(st.snapshot().settings.cost_pct_of_buy < crate::costs::HIGH_COST_PCT);
     }
 }

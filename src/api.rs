@@ -22,7 +22,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tower_http::services::ServeDir;
 
 use crate::copy::CopyView;
-use crate::state::{AppState, SettingsUpdate, SettingsView, Snapshot, Stamped};
+use crate::state::{AppState, SettingsUpdate, SettingsView, Snapshot, Stamped, TradingMode};
 use crate::trader::Trader;
 
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
@@ -129,6 +129,7 @@ pub fn router(app: Arc<AppState>, trader: Trader, token: String, ui_dir: PathBuf
         .route("/api/state", get(get_state))
         .route("/api/settings", post(post_settings))
         .route("/api/pause", post(post_pause))
+        .route("/api/mode", post(post_mode))
         .route("/api/copy", post(post_copy))
         .route("/api/copy/wallets", post(post_copy_wallet))
         .route("/api/copy/wallets/{address}", delete(delete_copy_wallet))
@@ -188,6 +189,15 @@ struct PauseBody {
 async fn post_pause(State(st): State<ApiState>, Json(body): Json<PauseBody>) -> Json<SettingsView> {
     st.app.set_paused(body.paused);
     Json(st.app.settings.view())
+}
+
+#[derive(Deserialize)]
+struct ModeBody {
+    mode: TradingMode,
+}
+
+async fn post_mode(State(st): State<ApiState>, Json(body): Json<ModeBody>) -> Json<SettingsView> {
+    Json(st.app.set_mode(body.mode))
 }
 
 #[derive(Deserialize)]
@@ -563,5 +573,53 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert!(!state.snapshot().copy.active);
+    }
+
+    #[tokio::test]
+    async fn the_trading_mode_can_be_changed_through_the_api() {
+        let (app, state) = app().await;
+        let token = "t".repeat(16);
+
+        let res = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/mode",
+                None,
+                Body::from(r#"{"mode":"sell_only"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        for (body, expected) in [
+            (
+                r#"{"mode":"sell_only"}"#,
+                crate::state::TradingMode::SellOnly,
+            ),
+            (r#"{"mode":"buy_only"}"#, crate::state::TradingMode::BuyOnly),
+            (
+                r#"{"mode":"buy_and_sell"}"#,
+                crate::state::TradingMode::BuyAndSell,
+            ),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(req("POST", "/api/mode", Some(&token), Body::from(body)))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(state.settings.mode(), expected);
+        }
+
+        for bad in [r#"{"mode":"both"}"#, r#"{}"#, "nonsense"] {
+            let res = app
+                .clone()
+                .oneshot(req("POST", "/api/mode", Some(&token), Body::from(bad)))
+                .await
+                .unwrap();
+            assert!(res.status().is_client_error(), "{bad} must be rejected");
+            assert_eq!(state.settings.mode(), crate::state::TradingMode::BuyAndSell);
+        }
     }
 }

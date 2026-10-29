@@ -14,8 +14,9 @@ use solana_sdk::message::compiled_instruction::CompiledInstruction;
 use solana_sdk::pubkey::Pubkey;
 
 use crate::config::{optional_parsed, positive_sol};
+use crate::persist::{self, Loaded};
 use crate::risk::{lamports_to_sol, Candidate};
-use crate::state::{PositionSource, MAX_BUY_AMOUNT_SOL};
+use crate::state::{PositionSource, TradingMode, MAX_BUY_AMOUNT_SOL};
 use crate::trader::{BuyRequest, Trader};
 use crate::types::{BuyAmounts, PUMP_FUN_PROGRAM_ID, PUMP_ORDER_BUY, PUMP_ORDER_SELL};
 
@@ -281,29 +282,23 @@ impl CopyFollow {
     /// startup list and switch, so what was set in the dashboard survives a restart. A file
     /// that cannot be read is ignored (and kept as it is until the next change).
     pub fn attach_store(&mut self, path: PathBuf) {
-        match std::fs::read_to_string(&path) {
-            Ok(text) => match serde_json::from_str::<SavedFollow>(&text) {
-                Ok(saved) => {
-                    let mut wallets = HashSet::new();
-                    for w in &saved.wallets {
-                        match self.parse_wallet(w) {
-                            Ok(k) => {
-                                wallets.insert(k);
-                            }
-                            Err(e) => warn!("Ignoring `{w}` in {}: {e}", path.display()),
+        match persist::read_json::<SavedFollow>(&path) {
+            Loaded::Value(saved) => {
+                let mut wallets = HashSet::new();
+                for w in &saved.wallets {
+                    match self.parse_wallet(w) {
+                        Ok(k) => {
+                            wallets.insert(k);
                         }
+                        Err(e) => warn!("Ignoring `{w}` in {}: {e}", path.display()),
                     }
-                    wallets.truncate_to(MAX_FOLLOWED_WALLETS);
-                    *self.wallets.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(wallets);
-                    self.enabled.store(saved.enabled, Ordering::Relaxed);
                 }
-                Err(e) => warn!(
-                    "Could not read {}: {e}; using the startup list",
-                    path.display()
-                ),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warn!(
+                wallets.truncate_to(MAX_FOLLOWED_WALLETS);
+                *self.wallets.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(wallets);
+                self.enabled.store(saved.enabled, Ordering::Relaxed);
+            }
+            Loaded::Missing => {}
+            Loaded::Unreadable(e) => warn!(
                 "Could not read {}: {e}; using the startup list",
                 path.display()
             ),
@@ -320,12 +315,7 @@ impl CopyFollow {
             enabled: self.enabled(),
             wallets: self.list(),
         };
-        let result = (|| -> std::io::Result<()> {
-            let json = serde_json::to_string_pretty(&saved).map_err(std::io::Error::other)?;
-            let tmp = path.with_extension("json.tmp");
-            std::fs::write(&tmp, json)?;
-            std::fs::rename(&tmp, path)
-        })();
+        let result = persist::write_json(path, &saved);
         *lock_err(&self.save_error) = match result {
             Ok(()) => None,
             Err(e) => {
@@ -453,6 +443,10 @@ pub fn handle_leader_trade(trader: &Trader, trade: LeaderTrade, slot: u64, block
     match trade.side {
         Side::Sell => {
             if copy.sell_with_leader && state.is_copy_held(&trade.mint) {
+                if !state.settings.mode().allows_sells() {
+                    state.record_skipped(&trade.mint, TradingMode::SELL_REFUSED);
+                    return;
+                }
                 info!(
                     "Leader {} sold {}: selling our copy",
                     trade.leader, trade.mint
@@ -477,6 +471,9 @@ fn copy_buy(trader: &Trader, trade: LeaderTrade, slot: u64, blockhash: Hash) {
 
     if state.settings.paused() {
         return skip("bot is paused".into());
+    }
+    if !state.settings.mode().allows_buys() {
+        return skip(TradingMode::BUY_REFUSED.into());
     }
     if trade.token_amount == 0 || trade.sol_amount == 0 {
         return skip("leader instruction has a zero amount".into());
@@ -1180,5 +1177,34 @@ mod tests {
         h.add_wallet(&key(1).to_string()).unwrap();
         assert!(h.active());
         assert!(h.save_error().unwrap().contains("could not save"));
+    }
+
+    #[tokio::test]
+    async fn the_trading_mode_gates_copy_buys_and_leader_sells() {
+        let bh = Hash::default();
+
+        // Sell-only: a leader buy is not copied.
+        let t = trader(cfg()).await;
+        t.state.set_mode(TradingMode::SellOnly);
+        handle_leader_trade(&t, trade(Side::Buy, key(140), 1_000_000_000), 100, bh);
+        assert!(has_skip(&t, "sell-only"));
+
+        // Buy-only: we keep a copy when the leader sells.
+        let t = trader(cfg()).await;
+        let copied = key(141);
+        t.state.record_buy_sent_from(
+            &copied,
+            &key(10),
+            "sig",
+            0.001,
+            999,
+            PositionSource::Copy {
+                leader: key(7).to_string(),
+            },
+        );
+        t.state.set_mode(TradingMode::BuyOnly);
+        handle_leader_trade(&t, trade(Side::Sell, copied, 1_000_000), 100, bh);
+        assert!(has_skip(&t, "buy-only"));
+        assert_eq!(t.state.snapshot().positions[0].status, PositionStatus::Held);
     }
 }
