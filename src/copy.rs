@@ -15,10 +15,11 @@ use solana_sdk::pubkey::Pubkey;
 
 use crate::config::{optional_parsed, positive_sol};
 use crate::persist::{self, Loaded};
+use crate::pump::parse::{self, Op, Quote};
 use crate::risk::{lamports_to_sol, Candidate};
 use crate::state::{PositionSource, TradingMode, MAX_BUY_AMOUNT_SOL};
 use crate::trader::{BuyRequest, Trader};
-use crate::types::{BuyAmounts, PUMP_FUN_PROGRAM_ID, PUMP_ORDER_BUY, PUMP_ORDER_SELL};
+use crate::types::BuyAmounts;
 
 const MAX_HOLD_SLOTS_LIMIT: u64 = 2_000;
 
@@ -341,12 +342,7 @@ impl TruncateTo for HashSet<Pubkey> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Side {
-    Buy,
-    Sell,
-}
+pub use crate::pump::parse::Side;
 
 /// A Pump.fun buy or sell made by one of the followed wallets.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -356,8 +352,11 @@ pub struct LeaderTrade {
     pub mint: Pubkey,
     /// The account the program pays the creator's fee to (the same one our own buy/sell
     /// instruction must carry).
-    pub creator_vault: Pubkey,
-    /// Tokens (raw units) and the SOL cap of the leader's instruction.
+    /// None when the leader used an instruction generation that does not carry it.
+    pub creator_vault: Option<Pubkey>,
+    /// What the token is priced in; only SOL tokens can be copied for now.
+    pub quote: Quote,
+    /// Tokens (raw units) and the quote cap of the leader's instruction (lamports for SOL).
     pub token_amount: u64,
     pub sol_amount: u64,
 }
@@ -368,14 +367,8 @@ impl LeaderTrade {
     }
 }
 
-// Account positions in the Pump.fun `buy` / `sell` instructions.
-pub(crate) const IX_MINT: usize = 2;
-pub(crate) const IX_USER: usize = 6;
-pub(crate) const IX_BUY_CREATOR_VAULT: usize = 9;
-const IX_SELL_CREATOR_VAULT: usize = 8;
-
-/// Looks for a Pump.fun buy or sell signed by a followed wallet. Never panics on
-/// malformed input; returns the first matching instruction.
+/// Looks for a Pump.fun buy or sell signed by a followed wallet, in any generation of the
+/// instructions. Never panics on malformed input; returns the first matching instruction.
 pub fn leader_trade(
     account_keys: &[Pubkey],
     instructions: &[CompiledInstruction],
@@ -385,52 +378,18 @@ pub fn leader_trade(
     if !account_keys.iter().any(|k| followed.contains(k)) {
         return None;
     }
-
-    let key_at = |ix: &CompiledInstruction, n: usize| -> Option<Pubkey> {
-        ix.accounts
-            .get(n)
-            .and_then(|i| account_keys.get(*i as usize))
-            .copied()
-    };
-
-    for ix in instructions {
-        if account_keys.get(ix.program_id_index as usize) != Some(&PUMP_FUN_PROGRAM_ID) {
-            continue;
-        }
-        let data = &ix.data;
-        if data.len() < 24 {
-            continue;
-        }
-        let side = if data[0..8] == PUMP_ORDER_BUY {
-            Side::Buy
-        } else if data[0..8] == PUMP_ORDER_SELL {
-            Side::Sell
-        } else {
-            continue;
-        };
-
-        let Some(leader) = key_at(ix, IX_USER).filter(|k| followed.contains(k)) else {
-            continue;
-        };
-        let vault_index = match side {
-            Side::Buy => IX_BUY_CREATOR_VAULT,
-            Side::Sell => IX_SELL_CREATOR_VAULT,
-        };
-        let (Some(mint), Some(creator_vault)) = (key_at(ix, IX_MINT), key_at(ix, vault_index))
-        else {
-            continue;
-        };
-
-        return Some(LeaderTrade {
-            side,
-            leader,
-            mint,
-            creator_vault,
-            token_amount: u64::from_le_bytes(data[8..16].try_into().ok()?),
-            sol_amount: u64::from_le_bytes(data[16..24].try_into().ok()?),
-        });
-    }
-    None
+    parse::ops(account_keys, instructions).find_map(|op| match op {
+        Op::Trade(t) if followed.contains(&t.user) => Some(LeaderTrade {
+            side: t.side,
+            leader: t.user,
+            mint: t.mint,
+            creator_vault: t.creator_vault,
+            quote: t.quote,
+            token_amount: t.token_amount,
+            sol_amount: t.quote_amount,
+        }),
+        _ => None,
+    })
 }
 
 /// Reacts to a followed wallet's trade. Buys are sent from their own task so a slow RPC
@@ -475,6 +434,12 @@ fn copy_buy(trader: &Trader, trade: LeaderTrade, slot: u64, blockhash: Hash) {
     if !state.settings.mode().allows_buys() {
         return skip(TradingMode::BUY_REFUSED.into());
     }
+    if trade.quote != Quote::Sol {
+        return skip("token is paired with USDC; copying it is not supported yet".into());
+    }
+    let Some(creator_vault) = trade.creator_vault else {
+        return skip("leader's instruction does not carry the creator vault".into());
+    };
     if trade.token_amount == 0 || trade.sol_amount == 0 {
         return skip("leader instruction has a zero amount".into());
     }
@@ -494,7 +459,7 @@ fn copy_buy(trader: &Trader, trade: LeaderTrade, slot: u64, blockhash: Hash) {
     let tip_sol = state.settings.bribe_fee_sol();
     let candidate = Candidate {
         // The creator's wallet when we saw the launch; the vault address is all we have otherwise.
-        creator: creator_wallet.as_ref().unwrap_or(&trade.creator_vault),
+        creator: creator_wallet.as_ref().unwrap_or(&creator_vault),
         name: None,
         symbol: None,
         dev_buy_sol: trade.sol(),
@@ -513,7 +478,7 @@ fn copy_buy(trader: &Trader, trade: LeaderTrade, slot: u64, blockhash: Hash) {
 
     trader.spawn_buy(BuyRequest {
         mint: trade.mint,
-        creator_vault: trade.creator_vault,
+        creator_vault,
         sol: buy_sol,
         tip_sol,
         reference: BuyAmounts {
@@ -531,6 +496,7 @@ fn copy_buy(trader: &Trader, trade: LeaderTrade, slot: u64, blockhash: Hash) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{PUMP_FUN_PROGRAM_ID, PUMP_ORDER_BUY, PUMP_ORDER_SELL};
 
     fn key(n: u8) -> Pubkey {
         Pubkey::new_from_array([n; 32])
@@ -572,7 +538,7 @@ mod tests {
         assert_eq!(buy.mint, key(3));
         assert_eq!(
             buy.creator_vault,
-            key(10),
+            Some(key(10)),
             "buy puts the creator vault at index 9"
         );
         assert_eq!((buy.token_amount, buy.sol_amount), (5_000, 7_000));
@@ -581,7 +547,7 @@ mod tests {
         assert_eq!(sell.side, Side::Sell);
         assert_eq!(
             sell.creator_vault,
-            key(9),
+            Some(key(9)),
             "sell puts the creator vault at index 8"
         );
     }
@@ -694,6 +660,7 @@ mod tests {
     // ---- handle_leader_trade, against a state with no reachable RPC ----
 
     use crate::community::{CommunityConfig, NewToken, ObservedBuy};
+    use crate::pump::parse::Quote;
     use crate::pumpfun::PumpFunSDK;
     use crate::pumpswap::constants::PriorityFeePump;
     use crate::state::{AppState, Event, PositionStatus, Settings};
@@ -729,10 +696,11 @@ mod tests {
 
     fn trade(side: Side, mint: Pubkey, sol: u64) -> LeaderTrade {
         LeaderTrade {
+            quote: Quote::Sol,
             side,
             leader: key(7),
             mint,
-            creator_vault: key(10),
+            creator_vault: Some(key(10)),
             token_amount: 1_000_000,
             sol_amount: sol,
         }
@@ -943,6 +911,7 @@ mod tests {
                     window_slots: 10,
                     min_buyers: 2,
                     min_volume_sol: 0.0,
+                    min_volume_usdc: 75.0,
                     max_token_age_slots: 100,
                 }),
         );
@@ -958,6 +927,7 @@ mod tests {
     fn launch(t: &Trader, mint: Pubkey, slot: u64) {
         t.state.community.track(NewToken {
             mint,
+            quote: Quote::Sol,
             creator_wallet: key(200),
             creator_vault: None,
             name: None,
@@ -973,7 +943,8 @@ mod tests {
             &ObservedBuy {
                 mint,
                 buyer: key(buyer),
-                creator_vault: key(10),
+                quote: Quote::Sol,
+                creator_vault: Some(key(10)),
                 token_amount: 1_000,
                 sol_amount: 1_000_000,
             },

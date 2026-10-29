@@ -4,6 +4,7 @@ pub mod config;
 pub mod copy;
 pub mod costs;
 pub mod persist;
+pub mod pump;
 pub mod pumpfun;
 pub mod pumpswap;
 pub mod risk;

@@ -20,11 +20,11 @@ use solana_sdk::message::compiled_instruction::CompiledInstruction;
 use solana_sdk::pubkey::Pubkey;
 
 use crate::config::optional_parsed;
-use crate::copy::{IX_BUY_CREATOR_VAULT, IX_MINT, IX_USER};
+use crate::pump::parse::{self, Op, Quote, Side};
 use crate::risk::{lamports_to_sol, Candidate};
 use crate::state::{PositionSource, TradingMode};
 use crate::trader::{BuyRequest, Trader};
-use crate::types::{BuyAmounts, PUMP_FUN_PROGRAM_ID, PUMP_ORDER_BUY};
+use crate::types::BuyAmounts;
 
 /// Unique buyers remembered per token; thresholds above this are rejected at startup.
 const MAX_BUYERS_TRACKED: usize = 128;
@@ -43,8 +43,11 @@ pub struct CommunityConfig {
     pub window_slots: u64,
     /// Different wallets (not the creator) that must have bought within the window.
     pub min_buyers: usize,
-    /// SOL (sum of the buys' caps) that must have been bid within the window.
+    /// SOL (sum of the buys' caps) that must have been bid within the window, for tokens
+    /// paired with SOL.
     pub min_volume_sol: f64,
+    /// The same threshold for tokens paired with USDC.
+    pub min_volume_usdc: f64,
     /// Copy-trade only follows buys of tokens at most this many slots old (0 = no limit).
     pub max_token_age_slots: u64,
 }
@@ -56,6 +59,7 @@ impl Default for CommunityConfig {
             window_slots: 10,
             min_buyers: 5,
             min_volume_sol: 0.5,
+            min_volume_usdc: 75.0,
             max_token_age_slots: 150,
         }
     }
@@ -67,6 +71,7 @@ pub struct CommunityView {
     pub window_slots: u64,
     pub min_buyers: usize,
     pub min_volume_sol: f64,
+    pub min_volume_usdc: f64,
     pub max_token_age_slots: u64,
     pub watching: usize,
 }
@@ -79,6 +84,7 @@ impl CommunityConfig {
             window_slots: optional_parsed("COMMUNITY_WINDOW_SLOTS", d.window_slots)?,
             min_buyers: optional_parsed("COMMUNITY_MIN_BUYERS", d.min_buyers)?,
             min_volume_sol: optional_parsed("COMMUNITY_MIN_VOLUME_SOL", d.min_volume_sol)?,
+            min_volume_usdc: optional_parsed("COMMUNITY_MIN_VOLUME_USDC", d.min_volume_usdc)?,
             max_token_age_slots: optional_parsed("MAX_TOKEN_AGE_SLOTS", d.max_token_age_slots)?,
         };
         cfg.validate()?;
@@ -90,6 +96,12 @@ impl CommunityConfig {
             bail!(
                 "COMMUNITY_MIN_VOLUME_SOL must be 0 (off) or positive, got {}",
                 self.min_volume_sol
+            );
+        }
+        if !self.min_volume_usdc.is_finite() || self.min_volume_usdc < 0.0 {
+            bail!(
+                "COMMUNITY_MIN_VOLUME_USDC must be 0 (off) or positive, got {}",
+                self.min_volume_usdc
             );
         }
         if self.require_community {
@@ -120,12 +132,25 @@ impl CommunityConfig {
                 self.min_buyers, self.window_slots
             ));
         }
-        let volume = lamports_to_sol(t.volume_lamports);
-        if self.min_volume_sol > 0.0 && volume < self.min_volume_sol {
-            return Err(format!(
-                "community: {volume:.2} of {} SOL bid within {} slots",
-                self.min_volume_sol, self.window_slots
-            ));
+        match t.quote {
+            Quote::Usdc => {
+                let volume = t.volume as f64 / 1e6;
+                if self.min_volume_usdc > 0.0 && volume < self.min_volume_usdc {
+                    return Err(format!(
+                        "community: {volume:.2} of {} USDC bid within {} slots",
+                        self.min_volume_usdc, self.window_slots
+                    ));
+                }
+            }
+            _ => {
+                let volume = lamports_to_sol(t.volume);
+                if self.min_volume_sol > 0.0 && volume < self.min_volume_sol {
+                    return Err(format!(
+                        "community: {volume:.2} of {} SOL bid within {} slots",
+                        self.min_volume_sol, self.window_slots
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -142,6 +167,8 @@ pub struct LastBuy {
 /// A token whose creation was just seen.
 pub struct NewToken {
     pub mint: Pubkey,
+    /// What the token is priced in.
+    pub quote: Quote,
     pub creator_wallet: Pubkey,
     /// Known from the creator's own launch buy; otherwise learned from the first buyer.
     pub creator_vault: Option<Pubkey>,
@@ -158,12 +185,16 @@ pub struct NewToken {
 pub struct ObservedBuy {
     pub mint: Pubkey,
     pub buyer: Pubkey,
-    pub creator_vault: Pubkey,
+    pub quote: Quote,
+    /// Newer instructions do not carry the creator vault.
+    pub creator_vault: Option<Pubkey>,
     pub token_amount: u64,
+    /// Quote units: lamports for SOL, millionths for USDC.
     pub sol_amount: u64,
 }
 
 struct Tracked {
+    quote: Quote,
     created_slot: u64,
     creator_wallet: Pubkey,
     creator_vault: Option<Pubkey>,
@@ -171,7 +202,8 @@ struct Tracked {
     symbol: Option<String>,
     dev_buy_sol: f64,
     buyers: HashSet<Pubkey>,
-    volume_lamports: u64,
+    /// Quote units bid, in the token's own quote.
+    volume: u64,
     last_buy: Option<LastBuy>,
     decided: bool,
 }
@@ -179,6 +211,7 @@ struct Tracked {
 /// A token whose watch window ended.
 pub struct Due {
     pub mint: Pubkey,
+    pub quote: Quote,
     pub creator_wallet: Pubkey,
     pub creator_vault: Option<Pubkey>,
     pub name: Option<String>,
@@ -225,6 +258,7 @@ impl CommunityTracker {
             window_slots: self.config.window_slots,
             min_buyers: self.config.min_buyers,
             min_volume_sol: self.config.min_volume_sol,
+            min_volume_usdc: self.config.min_volume_usdc,
             max_token_age_slots: self.config.max_token_age_slots,
             watching: self.watching(),
         }
@@ -248,6 +282,7 @@ impl CommunityTracker {
         inner.tokens.insert(
             t.mint,
             Tracked {
+                quote: t.quote,
                 created_slot: t.slot,
                 creator_wallet: t.creator_wallet,
                 creator_vault: t.creator_vault,
@@ -255,7 +290,7 @@ impl CommunityTracker {
                 symbol: t.symbol,
                 dev_buy_sol: t.dev_buy_sol,
                 buyers: HashSet::new(),
-                volume_lamports: 0,
+                volume: 0,
                 last_buy: t.reference,
                 decided: false,
             },
@@ -269,7 +304,12 @@ impl CommunityTracker {
         let Some(t) = inner.tokens.get_mut(&buy.mint) else {
             return;
         };
-        t.creator_vault.get_or_insert(buy.creator_vault);
+        if let Some(v) = buy.creator_vault {
+            t.creator_vault.get_or_insert(v);
+        }
+        if buy.quote != t.quote {
+            return;
+        }
         // Later buys give a fresher price than the creator's launch buy.
         t.last_buy = Some(LastBuy {
             token_amount: buy.token_amount,
@@ -282,7 +322,7 @@ impl CommunityTracker {
         if t.buyers.len() < MAX_BUYERS_TRACKED {
             t.buyers.insert(buy.buyer);
         }
-        t.volume_lamports = t.volume_lamports.saturating_add(buy.sol_amount);
+        t.volume = t.volume.saturating_add(buy.sol_amount);
     }
 
     /// Tokens whose window ended by `slot`, each returned once, and forgets expired ones.
@@ -303,6 +343,7 @@ impl CommunityTracker {
             t.decided = true;
             out.push(Due {
                 mint,
+                quote: t.quote,
                 creator_wallet: t.creator_wallet,
                 creator_vault: t.creator_vault,
                 name: t.name.clone(),
@@ -347,32 +388,21 @@ impl CommunityTracker {
     }
 }
 
-/// Every Pump.fun `buy` in a transaction, by anyone. Never panics on malformed input.
+/// Every Pump.fun buy in a transaction, by anyone, whichever generation of instruction.
 pub fn pump_buys<'a>(
     account_keys: &'a [Pubkey],
     instructions: &'a [CompiledInstruction],
 ) -> impl Iterator<Item = ObservedBuy> + 'a {
-    instructions.iter().filter_map(move |ix| {
-        if account_keys.get(ix.program_id_index as usize) != Some(&PUMP_FUN_PROGRAM_ID) {
-            return None;
-        }
-        let data = &ix.data;
-        if data.len() < 24 || data[0..8] != PUMP_ORDER_BUY {
-            return None;
-        }
-        let key_at = |n: usize| {
-            ix.accounts
-                .get(n)
-                .and_then(|i| account_keys.get(*i as usize))
-                .copied()
-        };
-        Some(ObservedBuy {
-            mint: key_at(IX_MINT)?,
-            buyer: key_at(IX_USER)?,
-            creator_vault: key_at(IX_BUY_CREATOR_VAULT)?,
-            token_amount: u64::from_le_bytes(data[8..16].try_into().ok()?),
-            sol_amount: u64::from_le_bytes(data[16..24].try_into().ok()?),
-        })
+    parse::ops(account_keys, instructions).filter_map(|op| match op {
+        Op::Trade(t) if t.side == Side::Buy => Some(ObservedBuy {
+            mint: t.mint,
+            buyer: t.user,
+            quote: t.quote,
+            creator_vault: t.creator_vault,
+            token_amount: t.token_amount,
+            sol_amount: t.quote_amount,
+        }),
+        _ => None,
     })
 }
 
@@ -400,6 +430,9 @@ fn decide(trader: &Trader, due: Due, slot: u64) {
     }
     if !state.settings.mode().allows_buys() {
         return skip(TradingMode::BUY_REFUSED);
+    }
+    if due.quote != Quote::Sol {
+        return skip("token is paired with USDC; buying it is not supported yet");
     }
     let (Some(reference), Some(creator_vault)) = (due.reference, due.creator_vault) else {
         return skip("no buy seen to price the order from");
@@ -449,6 +482,7 @@ fn decide(trader: &Trader, due: Due, slot: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{PUMP_FUN_PROGRAM_ID, PUMP_ORDER_BUY};
 
     fn key(n: u8) -> Pubkey {
         Pubkey::new_from_array([n; 32])
@@ -460,6 +494,7 @@ mod tests {
             window_slots: 10,
             min_buyers: 3,
             min_volume_sol: 0.5,
+            min_volume_usdc: 75.0,
             max_token_age_slots: 100,
         }
     }
@@ -467,6 +502,7 @@ mod tests {
     fn new_token(mint: u8, slot: u64) -> NewToken {
         NewToken {
             mint: key(mint),
+            quote: Quote::Sol,
             creator_wallet: key(200),
             creator_vault: None,
             name: Some("Moon Cat".into()),
@@ -481,7 +517,8 @@ mod tests {
         ObservedBuy {
             mint: key(mint),
             buyer: key(buyer),
-            creator_vault: key(99),
+            quote: Quote::Sol,
+            creator_vault: Some(key(99)),
             token_amount: 1_000,
             sol_amount: sol,
         }
@@ -511,10 +548,12 @@ mod tests {
         }));
         assert!(bad(CommunityConfig {
             min_volume_sol: -1.0,
+            min_volume_usdc: 75.0,
             ..cfg()
         }));
         assert!(bad(CommunityConfig {
             min_volume_sol: f64::NAN,
+            min_volume_usdc: 75.0,
             ..cfg()
         }));
         assert!(bad(CommunityConfig {
@@ -703,7 +742,7 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].mint, key(3));
         assert_eq!(found[0].buyer, key(7));
-        assert_eq!(found[0].creator_vault, key(10));
+        assert_eq!(found[0].creator_vault, Some(key(10)));
         assert_eq!((found[0].token_amount, found[0].sol_amount), (5, 7));
     }
 
@@ -758,6 +797,7 @@ mod tests {
     fn launch_with_dev_buy(t: &Trader, mint: u8, slot: u64) {
         t.state.community.track(NewToken {
             mint: key(mint),
+            quote: Quote::Sol,
             creator_wallet: key(200),
             creator_vault: Some(key(99)),
             name: Some("Moon Cat".into()),
@@ -834,6 +874,7 @@ mod tests {
         // A launch without a creator buy has nothing to price the order from.
         t.state.community.track(NewToken {
             mint: key(2),
+            quote: Quote::Sol,
             creator_wallet: key(200),
             creator_vault: None,
             name: None,
