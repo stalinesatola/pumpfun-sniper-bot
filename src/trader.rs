@@ -9,7 +9,6 @@ use solana_sdk::signer::Signer;
 
 use crate::pumpfun::PumpFunSDK;
 use crate::state::{AppState, Position, PositionSource};
-use crate::types::BuyAmounts;
 use solana_sdk::hash::Hash;
 
 /// How many times a sell is attempted before giving up on a position.
@@ -27,12 +26,12 @@ enum SellOutcome {
 /// failed.
 pub struct BuyRequest {
     pub mint: Pubkey,
-    pub creator_vault: Pubkey,
+    /// The wallet that launched the token, when known (shown on the position).
+    pub creator: Pubkey,
     pub sol: f64,
     pub tip_sol: f64,
-    /// A buy of this token whose price the order is sized from.
-    pub reference: BuyAmounts,
-    pub blockhash: Hash,
+    /// A recent blockhash seen on the feed; fetched from the RPC when there is none.
+    pub blockhash: Option<Hash>,
     pub sell_at_slot: u64,
     pub source: PositionSource,
 }
@@ -64,17 +63,23 @@ impl Trader {
             let mut sdk = trader.sdk.clone();
             sdk.priority_fee.jito_tip_fee = req.tip_sol;
 
-            let result = sdk
-                .buy(
-                    &req.mint,
-                    req.sol,
-                    trader.payer.insecure_clone(),
-                    req.blockhash,
-                    req.reference,
-                    req.creator_vault,
-                    state.risk.buy_slippage_percent,
-                )
-                .await;
+            let blockhash = match req.blockhash {
+                Some(h) => Ok(h),
+                None => sdk.latest_blockhash().await,
+            };
+            let result = match blockhash {
+                Ok(blockhash) => {
+                    sdk.buy(
+                        &req.mint,
+                        req.sol,
+                        trader.payer.insecure_clone(),
+                        blockhash,
+                        state.risk.buy_slippage_percent,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            };
 
             match result {
                 Ok((signature, _)) => {
@@ -82,7 +87,7 @@ impl Trader {
                     // The sell uses the real on-chain balance, not the buy estimate.
                     state.record_buy_sent_from(
                         &req.mint,
-                        &req.creator_vault,
+                        &req.creator,
                         &signature,
                         req.sol,
                         req.sell_at_slot,
@@ -139,7 +144,6 @@ impl Trader {
                 balance,
                 self.payer.insecure_clone(),
                 blockhash,
-                position.creator,
             )
             .await?;
 

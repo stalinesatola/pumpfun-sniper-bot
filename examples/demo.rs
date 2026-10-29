@@ -10,6 +10,7 @@ use std::time::Duration;
 use shred_pool_cache::api::{self, ApiConfig};
 use shred_pool_cache::copy::{CopyConfig, LeaderTrade, Side};
 use shred_pool_cache::costs;
+use shred_pool_cache::pump::parse::Quote;
 use shred_pool_cache::pumpfun::PumpFunSDK;
 use shred_pool_cache::pumpswap::constants::PriorityFeePump;
 use shred_pool_cache::state::{AppState, PositionSource, Settings, TradingMode};
@@ -138,7 +139,8 @@ async fn main() -> anyhow::Result<()> {
                             side: Side::Buy,
                             leader,
                             mint,
-                            creator_vault: Pubkey::new_unique(),
+                            creator_vault: Some(Pubkey::new_unique()),
+                            quote: Quote::Sol,
                             token_amount: 1_000_000,
                             sol_amount: 1_500_000_000,
                         };
@@ -147,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
                             let sol = state.copy.buy_sol;
                             state.record_buy_sent_from(
                                 &mint,
-                                &trade.creator_vault,
+                                &trade.creator_vault.unwrap(),
                                 "demo-copy-signature",
                                 sol,
                                 slot + 12,

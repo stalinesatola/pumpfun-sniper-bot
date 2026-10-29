@@ -133,7 +133,7 @@ The bot only buys **new coins**: tokens whose creation it saw live on the Shreds
 1. A token is created. The bot starts watching it instead of buying at once.
 2. For `COMMUNITY_WINDOW_SLOTS` slots (default 10, about 4 seconds) it counts the buys of that token made by *different* wallets (the creator's own wallet does not count) and the SOL they bid.
 3. At the end of the window it buys if there were at least `COMMUNITY_MIN_BUYERS` unique buyers (default 5) and at least `COMMUNITY_MIN_VOLUME_SOL` bid (default 0.5). Otherwise it records a `skipped` event with the numbers, e.g. `community: 2 of 5 unique buyers within 10 slots`.
-4. The usual [risk limits](#risk-limits), pause and one-position-per-token rules still apply, and the buy is sized from the most recent buy it saw, not the stale launch price.
+4. The usual [risk limits](#risk-limits), pause and one-position-per-token rules still apply, and the order asks for the tokens the bonding curve returns at that moment (read from the chain), less the slippage.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -141,6 +141,7 @@ The bot only buys **new coins**: tokens whose creation it saw live on the Shreds
 | `COMMUNITY_WINDOW_SLOTS` | 10 | How long to watch a new token (1-100 slots, ~0.4 s each) |
 | `COMMUNITY_MIN_BUYERS` | 5 | Different wallets that must have bought in that window |
 | `COMMUNITY_MIN_VOLUME_SOL` | 0.5 | SOL that must have been bid in that window (0 = off) |
+| `COMMUNITY_MIN_VOLUME_USDC` | 75 | The same for tokens paired with USDC (0 = off) |
 | `MAX_TOKEN_AGE_SLOTS` | 150 | [Copy-trade](#copy-trade) only follows buys of tokens at most this old (0 = no limit) |
 
 Copy-trade follows the same rule: it only copies a leader's buy of a **new** token (seen created, not older than `MAX_TOKEN_AGE_SLOTS`) that already meets the community thresholds. The leader's buy itself counts as one of the buyers.
@@ -256,6 +257,7 @@ This project started as [dexoryn](https://github.com/dexoryn)'s sniper; the cred
 - **Buy rule** — only new coins, and only once they show an active community (unique buyers and SOL bid within a short window); copy-trade follows the same rule.
 - **Copy-trade** — follow wallets and mirror their Pump.fun buys and sells, with the same risk checks, one position per token, and a safety exit; switch it on/off and edit the followed wallets from the dashboard, with the list saved across restarts.
 - **Risk limits** — position, spend and drawdown caps, balance reserve, creator and keyword filters, creator launch-buy range, and configurable buy slippage; every refusal is shown with its reason.
+- **Pump.fun as it is today** — Pump.fun now launches every token with `create_v2` (Token-2022) and has several generations of buy/sell instructions and quote assets (SOL, USDC, others). The old bot only knew the original `create`/`buy`/`sell`, so it saw no launches and its orders carried too few accounts. The feed parser now understands `create`, `create_v2` and every buy/sell variant, and orders are built as `buy_exact_quote_in_v3` / `sell_v3` with Token-2022-aware accounts. These transactions were checked against the real program with `simulateTransaction` (see `examples/probe.rs`), not just unit-tested. Tokens paired with USDC or another quote are tracked (own volume threshold `COMMUNITY_MIN_VOLUME_USDC`) but not bought yet.
 - **Fix** — the Pump.fun buy asked for the wrong number of tokens whenever the price was not close to the launch price (it multiplied by the price instead of dividing), so the buy could fail on-chain; it now sizes from the reference buy's own price.
 - **Dependencies and tooling** — migrated to Solana SDK 3.x on Rust 1.89, with byte-for-byte golden tests of the transactions and the Shredstream entry format captured before the upgrade; known vulnerabilities in the dependency tree went from 41 to 3 (all `zstd`, upstream); unused dependencies removed; `dotenv` replaced by `dotenvy`.
 - **Cleanup and CI** — about 6,300 lines of unused code removed (the old copy-trade listener, which did not compile, Yellowstone gRPC, Whirlpool, Jito searcher client); `cargo fmt`, GitHub Actions (format, build, test, clippy, UI build, informational `cargo audit`) and Dependabot.

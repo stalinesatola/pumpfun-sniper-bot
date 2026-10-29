@@ -1,77 +1,138 @@
 use crate::costs::{COMPUTE_UNIT_LIMIT, CU_PRICE_MICROLAMPORTS};
-use crate::pumpfun::constants::*;
+use crate::pump::ix::{self, Market};
+use crate::pump::market::{load_market, GlobalCache};
+use crate::pump::parse::Quote;
 use crate::pumpfun::error::{PumpFunError, PumpFunResult};
-use crate::pumpfun::instruction_builder;
-
 use crate::pumpswap::constants::PriorityFeePump;
-use crate::pumpswap::pool::calculate_with_slippage_buy;
-use crate::types::BuyAmounts;
+use crate::types::sol_to_lamports;
 
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSendTransactionConfig;
-use solana_sdk::instruction::AccountMeta;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_sdk::hash::Hash;
+use solana_sdk::instruction::{AccountMeta, Instruction};
+use solana_sdk::message::{v0::Message as MessageV0, VersionedMessage};
+use solana_sdk::pubkey;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Keypair;
+use solana_sdk::signer::Signer;
+use solana_sdk::transaction::VersionedTransaction;
+use solana_system_interface::instruction as system_instruction;
 
 use log::info;
-
-use solana_sdk::pubkey;
-use solana_sdk::signer::Signer;
-use spl_associated_token_account::instruction::create_associated_token_account;
-use std::{str::FromStr, sync::Arc};
-
 use rustls::crypto::{ring::default_provider, CryptoProvider};
-
-use crate::types::sol_to_lamports;
-use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_compute_budget_interface::ComputeBudgetInstruction;
-use solana_sdk::{
-    message::v0::Message as MessageV0, pubkey::Pubkey, signature::Keypair,
-    transaction::VersionedTransaction,
-};
-use solana_system_interface::instruction as system_instruction;
-use spl_associated_token_account::get_associated_token_address;
-
-use solana_sdk::hash::Hash;
+use std::sync::Arc;
 
 const ASTRALANE_TIP: Pubkey = pubkey!("astra4uejePWneqNaJKuFFA8oonqCE1sqF6b45kDMZm");
-const ZEROBLOCK_FEE: Pubkey = pubkey!("7mMzAuqiZemFTrQoquVvJqv53Xb1L4pN38D1A5T2iMEZ");
+/// Read-only marker account that keeps Jito bundles from placing the transaction after a
+/// front-running one ("don't front").
+const JITO_DONT_FRONT: Pubkey = pubkey!("jitodontfront11111111111111111ButMyNiggasDo");
 
-/// Raw token units that `sol_lamports` buys at the price implied by `reference` (a buy
-/// instruction's token amount and SOL cap). `None` if the reference has a zero amount.
-pub fn tokens_for_sol(sol_lamports: u64, reference: &BuyAmounts) -> Option<u64> {
-    if reference.base_amount_out == 0 || reference.max_quote_amount_in == 0 {
-        return None;
+/// The part of the transaction both directions share: compute budget, with the priority fee.
+fn compute_budget() -> Vec<Instruction> {
+    let mut limit = ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNIT_LIMIT);
+    limit.accounts.push(AccountMeta {
+        pubkey: JITO_DONT_FRONT,
+        is_signer: false,
+        is_writable: false,
+    });
+    vec![
+        limit,
+        ComputeBudgetInstruction::set_compute_unit_price(CU_PRICE_MICROLAMPORTS),
+    ]
+}
+
+fn sign(
+    payer: &Keypair,
+    instructions: &[Instruction],
+    blockhash: Hash,
+) -> PumpFunResult<VersionedTransaction> {
+    let message = MessageV0::try_compile(&payer.pubkey(), instructions, &[], blockhash)
+        .map_err(|e| PumpFunError::TransactionError(e.to_string()))?;
+    VersionedTransaction::try_new(VersionedMessage::V0(message), &[payer])
+        .map_err(|e| PumpFunError::TransactionError(e.to_string()))
+}
+
+/// The instructions of a buy: compute budget, the accounts it needs, spending exactly
+/// `spend` quote units for at least `min_tokens`, and the landing tip.
+pub fn buy_instructions(
+    market: &Market,
+    user: &Pubkey,
+    spend: u64,
+    min_tokens: u64,
+    tip_lamports: u64,
+) -> Vec<Instruction> {
+    let mut instructions = compute_budget();
+    instructions.extend(market.prepare_buy(user));
+    instructions.push(market.buy_exact_quote_in(user, spend, min_tokens));
+    instructions.push(system_instruction::transfer(
+        user,
+        &ASTRALANE_TIP,
+        tip_lamports,
+    ));
+    instructions
+}
+
+/// The instructions of a sell of `amount` tokens, optionally closing the token account
+/// afterwards (when it sells everything), which returns its rent.
+pub fn sell_instructions(
+    market: &Market,
+    user: &Pubkey,
+    amount: u64,
+    tip_lamports: u64,
+    close_account: bool,
+) -> Vec<Instruction> {
+    let mut instructions = compute_budget();
+    instructions.push(system_instruction::transfer(
+        user,
+        &ASTRALANE_TIP,
+        tip_lamports,
+    ));
+    instructions.push(market.sell(user, amount, 0));
+    if close_account {
+        instructions.push(market.close_token_account(user));
     }
-    let tokens = sol_lamports as u128 * reference.base_amount_out as u128
-        / reference.max_quote_amount_in as u128;
-    u64::try_from(tokens).ok()
+    instructions
+}
+
+/// A signed buy transaction. Pure: no network.
+pub fn buy_transaction(
+    market: &Market,
+    payer: &Keypair,
+    blockhash: Hash,
+    spend: u64,
+    min_tokens: u64,
+    tip_lamports: u64,
+) -> PumpFunResult<VersionedTransaction> {
+    let ixs = buy_instructions(market, &payer.pubkey(), spend, min_tokens, tip_lamports);
+    sign(payer, &ixs, blockhash)
+}
+
+/// A signed sell transaction. Pure: no network.
+pub fn sell_transaction(
+    market: &Market,
+    payer: &Keypair,
+    blockhash: Hash,
+    amount: u64,
+    tip_lamports: u64,
+    close_account: bool,
+) -> PumpFunResult<VersionedTransaction> {
+    let ixs = sell_instructions(market, &payer.pubkey(), amount, tip_lamports, close_account);
+    sign(payer, &ixs, blockhash)
+}
+
+/// The least tokens a buy must give: what the curve returns now, less `slippage_percent`.
+pub fn min_tokens_out(expected: u64, slippage_percent: u64) -> u64 {
+    let keep = 100u128.saturating_sub(slippage_percent as u128);
+    (expected as u128 * keep / 100) as u64
 }
 
 #[derive(Clone)]
 pub struct PumpFunSDK {
     pub client: Arc<RpcClient>,
     pub astralane_client: Arc<RpcClient>,
-    // pub jito_client: Arc<JitoClient>,
     pub priority_fee: PriorityFeePump,
-}
-
-pub struct PumpFunBuyType {
-    pub mint: Pubkey,
-    pub sol_to_buy: f64,
-    pub user_keypair: Keypair,
-    pub blockhash: Hash,
-    pub buy_amounts: BuyAmounts,
-    pub slippage: u64,
-    pub cu_price: u64,
-    pub creator: Pubkey, // TODO: new pumpfun update
-}
-
-pub struct PumpFunSellType {
-    pub mint: Pubkey,
-    pub token_amount_lamports: u64,
-    pub user_keypair: Keypair,
-    pub blockhash: Hash,
-    pub slippage: u64,
-    pub cu_price: u64,
-    pub creator: Pubkey, // TODO: new pumpfun update
+    globals: Arc<GlobalCache>,
 }
 
 impl PumpFunSDK {
@@ -80,213 +141,35 @@ impl PumpFunSDK {
             // Another thread may install a provider between the check and here; that is fine.
             let _ = default_provider().install_default();
         }
-        let client = Arc::new(RpcClient::new(String::from(rpc_url)));
-        let astralane_client = Arc::new(RpcClient::new(astralane_url.to_string()));
-
         PumpFunSDK {
-            client,
-            astralane_client,
-            // jito_client: Arc::new(
-            //     JitoClient::new(rpc_url.to_string(), jito_block_engine_url.to_string())
-            //         .await
-            //         .unwrap(),
-            // ),
+            client: Arc::new(RpcClient::new(String::from(rpc_url))),
+            astralane_client: Arc::new(RpcClient::new(astralane_url.to_string())),
             priority_fee,
+            globals: Arc::new(GlobalCache::default()),
         }
     }
 
-    pub async fn create_buy_tx(
-        &self,
-        params: PumpFunBuyType,
-    ) -> PumpFunResult<(VersionedTransaction, u64)> {
-        let sol_to_buy_lamports = sol_to_lamports(params.sol_to_buy);
-        let user_pubkey = params.user_keypair.pubkey();
-
-        // Same price as the observed buy (its SOL cap over its token amount), so we ask for
-        // the tokens our SOL buys at that price.
-        let bought_token_amount = tokens_for_sol(sol_to_buy_lamports, &params.buy_amounts)
-            .ok_or_else(|| {
-                PumpFunError::TransactionError("reference buy has a zero amount".to_string())
-            })?;
-        let price: f64 = (params.buy_amounts.max_quote_amount_in as f64 / 1_000_000_000.0)
-            / (params.buy_amounts.base_amount_out as f64 / 1_000_000.0);
-
-        let sol_to_buy_after_slippage =
-            calculate_with_slippage_buy(sol_to_buy_lamports, params.slippage);
-
-        info!(
-            "🚀 BUY REQUEST: Mint {} - User {} - Amount {} SOL ({} lamports)",
-            params.mint, &user_pubkey, params.sol_to_buy, sol_to_buy_lamports
-        );
-
-        info!("Token price: {}", price);
-        info!(
-            "Sol to lamports after slippage: {}",
-            sol_to_buy_after_slippage
-        );
-        info!("Bought token amount: {}", bought_token_amount);
-
-        // Create ATA creation instruction for token being bought
-        let create_token_ata_ix = create_associated_token_account(
-            &user_pubkey,
-            &user_pubkey,
-            &params.mint,
-            &PUMPFUN_TOKEN_PROGRAM,
-        );
-
-        let user_ata = get_associated_token_address(&user_pubkey, &params.mint);
-
-        // Create the PumpFun Buy TX
-        let pumpswap_buy_tx = instruction_builder::create_buy_instruction(
-            &user_pubkey,
-            &params.mint,
-            &user_ata,
-            bought_token_amount,
-            sol_to_buy_after_slippage,
-            &params.creator,
-        )?;
-
-        // Create compute budget instructions
-        let mut compute_unit_limit_ix =
-            ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNIT_LIMIT);
-        let jitodontfront = AccountMeta {
-            pubkey: Pubkey::from_str("jitodontfront11111111111111111ButMyNiggasDo").unwrap(),
-            is_signer: false,
-            is_writable: false,
-        };
-        compute_unit_limit_ix.accounts.push(jitodontfront);
-
-        let compute_unit_price_ix = ComputeBudgetInstruction::set_compute_unit_price(
-            params.cu_price * CU_PRICE_MICROLAMPORTS,
-        ); // 25 lamports
-
-        // let tip_acc_str = self.jito_client.get_tip_account().await.unwrap();
-        // let jito_fee_ix = system_instruction::transfer(
-        //     &user_pubkey,
-        //     &Pubkey::from_str(&tip_acc_str).unwrap(),
-        //     sol_to_lamports(self.priority_fee.jito_tip_fee),
-        // );
-
-        let astralane_fee_tx = system_instruction::transfer(
-            &user_pubkey,
-            &ASTRALANE_TIP,
-            sol_to_lamports(self.priority_fee.jito_tip_fee),
-        );
-
-        let point_five_percent = (sol_to_buy_lamports as f64 * 0.005) as u64;
-        let zeroblock_fee =
-            system_instruction::transfer(&user_pubkey, &ZEROBLOCK_FEE, point_five_percent);
-
-        // Combine instructions in correct order
-        let instructions = vec![
-            compute_unit_limit_ix,
-            compute_unit_price_ix,
-            // zeroblock_fee,
-            create_token_ata_ix,
-            pumpswap_buy_tx,
-            astralane_fee_tx,
-        ];
-
-        // Create and sign transaction
-        let message = MessageV0::try_compile(&user_pubkey, &instructions, &[], params.blockhash)
-            .map_err(|e| PumpFunError::TransactionError(e.to_string()))?;
-
-        let tx = VersionedTransaction::try_new(
-            solana_sdk::message::VersionedMessage::V0(message),
-            &[params.user_keypair],
-        )
-        .map_err(|e| PumpFunError::TransactionError(e.to_string()))?;
-
-        Ok((tx, bought_token_amount))
+    /// Reads the program's global settings now, so the first trade does not wait for them.
+    pub async fn warm_up(&self) -> PumpFunResult<()> {
+        self.globals
+            .refresh(&self.client)
+            .await
+            .map(|_| ())
+            .map_err(|e| PumpFunError::TransactionError(format!("{e:#}")))
     }
 
-    pub async fn create_sell_exact_amount_tx(
-        &self,
-        params: PumpFunSellType,
-    ) -> PumpFunResult<VersionedTransaction> {
-        info!(
-            "🚀 SELL REQUEST: Mint {} - User {} - Amount {} lamports",
-            params.mint,
-            params.user_keypair.pubkey(),
-            params.token_amount_lamports
-        );
-
-        let user = params.user_keypair.pubkey();
-        // Note: No jito for now
-        // let tip_acc_str = self.jito_client.get_tip_account().await.unwrap();
-        // let jito_fee_ix = system_instruction::transfer(
-        //     &params.user_keypair.pubkey(),
-        //     &Pubkey::from_str(&tip_acc_str).unwrap(),
-        //     sol_to_lamports(self.priority_fee.jito_tip_fee),
-        // );
-
-        let astralane_fee_tx = system_instruction::transfer(
-            &user,
-            &ASTRALANE_TIP,
-            sol_to_lamports(self.priority_fee.jito_tip_fee),
-        );
-
-        // TODO: Add sell slippage support
-        // let slippage_sell_amount_tokens = calculate_with_slippage_sell(params.token_amount_lamports, params.slippage * 100);
-        // let slippage_sell_amount_sol =
-
-        let user_ata: Pubkey = get_associated_token_address(&user, &params.mint);
-
-        // Create sell instruction
-        let pumpswap_sell_tx = instruction_builder::create_sell_instruction(
-            &user,
-            &params.mint,
-            &user_ata,
-            params.token_amount_lamports,
-            0,
-            &params.creator,
-        )?;
-
-        // Create compute budget instructions
-        let compute_unit_limit_ix =
-            ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNIT_LIMIT);
-        let compute_unit_price_ix = ComputeBudgetInstruction::set_compute_unit_price(
-            params.cu_price * CU_PRICE_MICROLAMPORTS,
-        );
-
-        let zeroblock_fee =
-            system_instruction::transfer(&user, &ZEROBLOCK_FEE, sol_to_lamports(0.0001));
-
-        let close_ata = spl_token::instruction::close_account(
-            &PUMPFUN_TOKEN_PROGRAM,
-            &user_ata,
-            &user,
-            &user,
-            &[],
-        )
-        .map_err(|e| PumpFunError::TransactionError(e.to_string()))?;
-
-        // Combine instructions
-        let instructions = vec![
-            compute_unit_limit_ix,
-            compute_unit_price_ix,
-            // zeroblock_fee,
-            astralane_fee_tx,
-            pumpswap_sell_tx,
-            close_ata,
-        ];
-
-        // Create and sign transaction
-        let message = MessageV0::try_compile(&user, &instructions, &[], params.blockhash)
-            .map_err(|e| PumpFunError::TransactionError(e.to_string()))?;
-        let tx = VersionedTransaction::try_new(
-            solana_sdk::message::VersionedMessage::V0(message),
-            &[params.user_keypair],
-        )
-        .map_err(|e| PumpFunError::TransactionError(e.to_string()))?;
-
-        Ok(tx)
+    async fn market(&self, mint: &Pubkey) -> PumpFunResult<Market> {
+        load_market(&self.client, &self.globals, mint)
+            .await
+            .map_err(|e| PumpFunError::TransactionError(format!("{e:#}")))
     }
 
-    /// Token balance (raw units) of `owner`'s associated token account for `mint`.
-    /// Returns 0 when the account does not exist yet (e.g. the buy has not landed).
+    /// Token balance (raw units) of `owner`'s associated token account for `mint`, whichever
+    /// token program the mint uses. Returns 0 when the account does not exist yet (e.g. the
+    /// buy has not landed).
     pub async fn token_balance(&self, owner: &Pubkey, mint: &Pubkey) -> PumpFunResult<u64> {
-        let ata = get_associated_token_address(owner, mint);
+        let program = self.client.get_account(mint).await?.owner;
+        let ata = ix::ata(owner, mint, &program);
         match self.client.get_token_account_balance(&ata).await {
             Ok(balance) => balance
                 .amount
@@ -301,83 +184,92 @@ impl PumpFunSDK {
         Ok(self.client.get_latest_blockhash().await?)
     }
 
-    async fn place_tx(self, tx: VersionedTransaction) -> PumpFunResult<String> {
-        // Do not use Jito GRPC for now.
-        // let _ = match self
-        //     .jito_client
-        //     .send_bundle_no_wait(&vec![tx.clone()])
-        //     .await
-        // {
-        //     Ok(signs) => Ok(signs.to_string()),
-        //     Err(e) => Err(PumpFunError::TransactionError(e.to_string())),
-        // };
+    async fn place_tx(&self, tx: VersionedTransaction) -> PumpFunResult<String> {
         let txconfig = RpcSendTransactionConfig {
             skip_preflight: true,
             ..Default::default()
         };
-
-        match self
-            .astralane_client
+        self.astralane_client
             .send_transaction_with_config(&tx, txconfig)
             .await
-        {
-            Ok(signs) => Ok(signs.to_string()),
-            Err(e) => Err(PumpFunError::TransactionError(e.to_string())),
-        }
+            .map(|s| s.to_string())
+            .map_err(|e| PumpFunError::TransactionError(e.to_string()))
     }
 
+    /// Sells the whole `token_amount` on the bonding curve.
     pub async fn sell(
-        self,
+        &self,
         mint: &Pubkey,
         token_amount: u64,
         user_keypair: Keypair,
         blockhash: Hash,
-        creator: Pubkey,
     ) -> PumpFunResult<String> {
-        let pump_sell_order = PumpFunSellType {
-            mint: *mint,
-            token_amount_lamports: token_amount,
-            user_keypair,
+        info!(
+            "SELL REQUEST: mint {} user {} amount {}",
+            mint,
+            user_keypair.pubkey(),
+            token_amount
+        );
+        let market = self.market(mint).await?;
+        if market.curve.complete {
+            return Err(PumpFunError::TransactionError(
+                "the bonding curve is complete: the token moved to PumpSwap, which the bot cannot sell on yet; sell it by hand".into(),
+            ));
+        }
+        let tx = sell_transaction(
+            &market,
+            &user_keypair,
             blockhash,
-            slippage: 0,
-            cu_price: 1,
-            creator,
-        };
-
-        let tx = self.create_sell_exact_amount_tx(pump_sell_order).await?;
-
+            token_amount,
+            sol_to_lamports(self.priority_fee.jito_tip_fee),
+            true,
+        )?;
         self.place_tx(tx).await
     }
 
+    /// Buys `sol_to_buy` SOL worth of `mint` on the bonding curve, asking for the tokens the
+    /// curve returns right now less `slippage_percent`. Returns the signature and the
+    /// tokens expected.
     pub async fn buy(
-        self,
+        &self,
         mint: &Pubkey,
         sol_to_buy: f64,
         user_keypair: Keypair,
         blockhash: Hash,
-        buy_amounts: BuyAmounts,
-        creator: Pubkey,
         slippage_percent: u64,
     ) -> PumpFunResult<(String, u64)> {
-        let pump_buy_order = PumpFunBuyType {
-            mint: *mint,
+        let market = self.market(mint).await?;
+        if market.curve.complete {
+            return Err(PumpFunError::TransactionError(
+                "the bonding curve is complete: the token moved to PumpSwap".into(),
+            ));
+        }
+        if market.curve.quote != Quote::Sol {
+            return Err(PumpFunError::TransactionError(format!(
+                "token is priced in {:?}; buying it needs a budget in that asset, which is not configured yet",
+                market.curve.quote
+            )));
+        }
+        let spend = sol_to_lamports(sol_to_buy);
+        let expected = market.curve.tokens_for_quote(spend).ok_or_else(|| {
+            PumpFunError::TransactionError("the bonding curve has no liquidity".into())
+        })?;
+        info!(
+            "BUY REQUEST: mint {} user {} spend {} SOL, expecting {} tokens",
+            mint,
+            user_keypair.pubkey(),
             sol_to_buy,
-            user_keypair,
+            expected
+        );
+        let tx = buy_transaction(
+            &market,
+            &user_keypair,
             blockhash,
-            buy_amounts,
-            slippage: slippage_percent,
-            cu_price: 1,
-            creator,
-        };
-
-        let tx = self.create_buy_tx(pump_buy_order).await?;
-
-        let order_placement_res = match self.place_tx(tx.0).await {
-            Ok(x) => x,
-            Err(e) => return Err(e),
-        };
-
-        Ok((order_placement_res, tx.1))
+            spend,
+            min_tokens_out(expected, slippage_percent),
+            sol_to_lamports(self.priority_fee.jito_tip_fee),
+        )?;
+        Ok((self.place_tx(tx).await?, expected))
     }
 }
 
@@ -385,40 +277,15 @@ impl PumpFunSDK {
 mod tests {
     use super::*;
 
-    fn amounts(tokens: u64, sol: u64) -> BuyAmounts {
-        BuyAmounts {
-            base_amount_out: tokens,
-            max_quote_amount_in: sol,
-        }
-    }
-
     #[test]
-    fn tokens_scale_with_our_sol_at_the_reference_price() {
-        // Reference: 35,000,000 tokens (6 decimals) for 1 SOL.
-        let reference = amounts(35_000_000_000_000, 1_000_000_000);
-        // 0.01 SOL buys 1/100 of that, whatever the price level.
+    fn slippage_lowers_the_minimum_tokens() {
+        assert_eq!(min_tokens_out(1_000, 5), 950);
+        assert_eq!(min_tokens_out(1_000, 0), 1_000);
+        assert_eq!(min_tokens_out(1_000, 100), 0);
+        assert_eq!(min_tokens_out(1_000, 250), 0, "never underflows");
         assert_eq!(
-            tokens_for_sol(10_000_000, &reference),
-            Some(350_000_000_000)
-        );
-        // Twice the price (half the tokens per SOL) => half the tokens.
-        let pricier = amounts(17_500_000_000_000, 1_000_000_000);
-        assert_eq!(tokens_for_sol(10_000_000, &pricier), Some(175_000_000_000));
-        // Spending what the reference spent returns the reference amount.
-        assert_eq!(
-            tokens_for_sol(1_000_000_000, &reference),
-            Some(35_000_000_000_000)
-        );
-    }
-
-    #[test]
-    fn zero_or_huge_references_are_rejected_not_divided() {
-        assert_eq!(tokens_for_sol(1, &amounts(0, 5)), None);
-        assert_eq!(tokens_for_sol(1, &amounts(5, 0)), None);
-        assert_eq!(
-            tokens_for_sol(u64::MAX, &amounts(u64::MAX, 1)),
-            None,
-            "overflow"
+            min_tokens_out(u64::MAX, 5),
+            (u64::MAX as u128 * 95 / 100) as u64
         );
     }
 }

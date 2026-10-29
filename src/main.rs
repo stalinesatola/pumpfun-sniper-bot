@@ -21,13 +21,8 @@ use shred_pool_cache::pumpswap::constants::PriorityFeePump;
 use shred_pool_cache::risk::{lamports_to_sol, RiskConfig};
 use shred_pool_cache::state::{AppState, Settings};
 use shred_pool_cache::trader::Trader;
-use shred_pool_cache::types::*;
 use solana_client::rpc_client::SerializableTransaction;
-use solana_sdk::message::compiled_instruction::CompiledInstruction;
-use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::Signer;
-
-const PUMP_CREATE_DISCRIMINATOR: [u8; 8] = [24, 30, 200, 40, 5, 28, 7, 119];
 
 const MIN_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
@@ -91,6 +86,13 @@ async fn main() -> Result<()> {
         jito_tip_fee: config.bribe_fee,
     };
     let sdk = PumpFunSDK::new(&config.rpc_url, &config.astralane_url, priority_fee).await;
+    // The program's global settings are needed by every trade; read them now.
+    match sdk.warm_up().await {
+        Ok(()) => info!("Read the Pump.fun global settings"),
+        Err(e) => warn!(
+            "Could not read the Pump.fun global settings yet ({e}); will retry on the first trade"
+        ),
+    }
 
     // Where the trading mode is saved ("off" = do not save).
     let rules_store = match env::var("RULES_STATE_FILE") {
@@ -232,12 +234,6 @@ fn log_configuration(config: &Config, state: &AppState) {
     );
 }
 
-fn is_create_ix(account_keys: &[Pubkey], ix: &CompiledInstruction) -> bool {
-    ix.data.len() >= 8
-        && ix.data[0..8] == PUMP_CREATE_DISCRIMINATOR
-        && account_keys.get(ix.program_id_index as usize) == Some(&PUMP_FUN_PROGRAM_ID)
-}
-
 /// Connects to the Shredstream proxy and processes slots until the stream ends or fails.
 // `Entry` is flagged as unstable Agave API in newer releases; tests/golden_tx.rs pins its wire format.
 #[allow(deprecated)]
@@ -294,47 +290,58 @@ async fn run_stream(config: &Config, trader: &Trader) -> Result<()> {
                     }
                 }
 
-                let Some(create_ix) = instructions
-                    .iter()
-                    .find(|ix| is_create_ix(account_keys, ix))
+                let Some(create) = shred_pool_cache::pump::parse::ops(account_keys, instructions)
+                    .find_map(|op| match op {
+                        shred_pool_cache::pump::parse::Op::Create(c) => Some(c),
+                        _ => None,
+                    })
                 else {
                     continue;
                 };
 
                 let signature = tx.get_signature().to_string();
-                info!("Found PumpFun Create TX: {}", signature);
+                info!(
+                    "Found PumpFun {} TX: {} ({})",
+                    if create.v2 { "create_v2" } else { "create" },
+                    signature,
+                    create.symbol
+                );
 
-                let parsed_txn = match PumpFunTXInfo::from_create_tx(tx, create_ix) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!("Could not parse create TX {}: {:?}", signature, e);
-                        continue;
-                    }
-                };
                 // The fee payer is the wallet that launched the token.
-                let Some(creator_wallet) = account_keys.first().copied() else {
-                    continue;
-                };
-
-                state.record_create(&parsed_txn.mint, &creator_wallet, &signature, curr_slot);
+                let creator_wallet = create.user;
+                state.record_create(&create.mint, &creator_wallet, &signature, curr_slot);
 
                 // The creator's own launch buy, if any, is the first price we have.
-                let launch_buy = match parsed_txn.amounts {
-                    Amounts::BuyAmounts(b) if b.base_amount_out > 0 => Some(b),
-                    _ => None,
+                let launch_buy = shred_pool_cache::pump::parse::ops(account_keys, instructions)
+                    .find_map(|op| match op {
+                        shred_pool_cache::pump::parse::Op::Trade(t)
+                            if t.side == shred_pool_cache::pump::parse::Side::Buy
+                                && t.mint == create.mint
+                                && t.token_amount > 0 =>
+                        {
+                            Some(t)
+                        }
+                        _ => None,
+                    });
+                let lamports_if_sol = |t: &shred_pool_cache::pump::parse::Trade| {
+                    if t.quote == shred_pool_cache::pump::parse::Quote::Sol {
+                        lamports_to_sol(t.quote_amount)
+                    } else {
+                        0.0
+                    }
                 };
-                let meta = parse_create_metadata(&create_ix.data);
                 state.community.track(NewToken {
-                    mint: parsed_txn.mint,
+                    mint: create.mint,
+                    quote: create.quote,
                     creator_wallet,
-                    creator_vault: launch_buy.map(|_| parsed_txn.creator),
-                    name: meta.as_ref().map(|m| m.0.clone()),
-                    symbol: meta.as_ref().map(|m| m.1.clone()),
-                    dev_buy_sol: launch_buy.map_or(0.0, |b| lamports_to_sol(b.max_quote_amount_in)),
+                    creator_vault: launch_buy.and_then(|t| t.creator_vault),
+                    name: Some(create.name.clone()),
+                    symbol: Some(create.symbol.clone()),
+                    dev_buy_sol: launch_buy.as_ref().map_or(0.0, lamports_if_sol),
                     slot: curr_slot,
-                    reference: launch_buy.map(|b| LastBuy {
-                        token_amount: b.base_amount_out,
-                        sol_amount: b.max_quote_amount_in,
+                    reference: launch_buy.map(|t| LastBuy {
+                        token_amount: t.token_amount,
+                        sol_amount: t.quote_amount,
                         blockhash,
                     }),
                 });
