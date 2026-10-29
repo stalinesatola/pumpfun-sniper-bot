@@ -38,6 +38,7 @@ This bot ingests **Jito Shredstream entries** over gRPC, deserializes shreds, an
 
 - **Pump.fun create sniper** — parse mint, creator, amounts, and blockhash from the create tx
 - **Jito Shredstream** — `ShredstreamProxy` subscribe, not Yellowstone-only logs
+- **New coins with an active community** — only buys tokens created live, and only after enough different wallets bought them
 - **Copy-trade** — mirror the Pump.fun buys of wallets you follow, sell when they sell
 - **Risk limits** — position / spend / drawdown caps, slippage, creator and keyword filters
 - **Dashboard** — web panel and terminal UI with live settings
@@ -124,6 +125,30 @@ Every new token is checked before a buy; a refused one shows up as `skipped` in 
 
 Sells still go out at any price (`min_sol_output = 0`): in a dumping market getting out matters more than the price, so there is no sell slippage limit. There is no stop-loss or take-profit; positions are sold after `SELL_DELAY_SLOTS`.
 
+### Buy rule: new coins with an active community
+
+The bot only buys **new coins**: tokens whose creation it saw live on the Shredstream (nothing that already existed when it started). With `REQUIRE_COMMUNITY=true` (the default) it then waits and buys only if the token shows an **active community**:
+
+1. A token is created. The bot starts watching it instead of buying at once.
+2. For `COMMUNITY_WINDOW_SLOTS` slots (default 10, about 4 seconds) it counts the buys of that token made by *different* wallets (the creator's own wallet does not count) and the SOL they bid.
+3. At the end of the window it buys if there were at least `COMMUNITY_MIN_BUYERS` unique buyers (default 5) and at least `COMMUNITY_MIN_VOLUME_SOL` bid (default 0.5). Otherwise it records a `skipped` event with the numbers, e.g. `community: 2 of 5 unique buyers within 10 slots`.
+4. The usual [risk limits](#risk-limits), pause and one-position-per-token rules still apply, and the buy is sized from the most recent buy it saw, not the stale launch price.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `REQUIRE_COMMUNITY` | `true` | `false` buys new coins as soon as they are created, with no community check |
+| `COMMUNITY_WINDOW_SLOTS` | 10 | How long to watch a new token (1-100 slots, ~0.4 s each) |
+| `COMMUNITY_MIN_BUYERS` | 5 | Different wallets that must have bought in that window |
+| `COMMUNITY_MIN_VOLUME_SOL` | 0.5 | SOL that must have been bid in that window (0 = off) |
+| `MAX_TOKEN_AGE_SLOTS` | 150 | [Copy-trade](#copy-trade) only follows buys of tokens at most this old (0 = no limit) |
+
+Copy-trade follows the same rule: it only copies a leader's buy of a **new** token (seen created, not older than `MAX_TOKEN_AGE_SLOTS`) that already meets the community thresholds. The leader's buy itself counts as one of the buyers.
+
+What this does and does not tell you:
+- Waiting means you buy **later and at a higher price** than a same-slot snipe, and some tokens that would have run are missed. That is the price of not buying dead launches. Tune the window and thresholds, or set `REQUIRE_COMMUNITY=false`.
+- The SOL amounts are what buyers were *willing* to pay (the cap in their instruction), not what they paid.
+- It is on-chain activity only: one person with many wallets can fake unique buyers, and it does not look at Twitter, Telegram or the token page. It filters out launches nobody is buying; it does not prove the community is real.
+
 ### Copy-trade
 
 Set `COPY_WALLETS` (comma-separated addresses) and the bot also watches those wallets on the same Shredstream feed. When one of them **buys** on the Pump.fun bonding curve, the bot buys the same token with a fixed amount; when it **sells** a token you copied, the bot sells yours. Leave `COPY_WALLETS` empty to turn it off.
@@ -136,10 +161,10 @@ Set `COPY_WALLETS` (comma-separated addresses) and the bot also watches those wa
 | `COPY_SELL_WITH_LEADER` | `true` | Sell when the leader sells the same token |
 | `COPY_MAX_HOLD_SLOTS` | 150 | Safety exit: sell after this many slots even if the leader never sells |
 
-Copied buys go through the same checks as snipes: the [risk limits](#risk-limits), pause, and one position per token (a token you already hold, or are buying, is never bought twice). Refusals show up as `skipped` with the reason, every leader trade shows up as a `leader` event, and positions are tagged `snipe` or `copy` in the dashboard and the terminal UI.
+Copied buys go through the same checks as snipes: the [new-coin and community rule](#buy-rule-new-coins-with-an-active-community), the [risk limits](#risk-limits), pause, and one position per token (a token you already hold, or are buying, is never bought twice). Refusals show up as `skipped` with the reason, every leader trade shows up as a `leader` event, and positions are tagged `snipe` or `copy` in the dashboard and the terminal UI.
 
 Things to know:
-- Only **Pump.fun bonding-curve** trades are copied, not PumpSwap, and only transactions whose accounts are listed directly (not through address lookup tables).
+- Only **Pump.fun bonding-curve** trades of **new** tokens are copied (see the buy rule above), not PumpSwap, and only transactions whose accounts are listed directly (not through address lookup tables).
 - The leader's "size" is the SOL cap in their instruction, which includes their own slippage allowance, not necessarily what they paid.
 - Your buy lands *after* the leader's, so you pay a higher price. The price used for sizing is the leader's own maximum price; keep `BUY_SLIPPAGE_PERCENT` high enough for your buy to still land.
 - The bot refuses to start if `COPY_WALLETS` contains its own wallet.
@@ -206,6 +231,7 @@ This project started as [dexoryn](https://github.com/dexoryn)'s sniper; the cred
 - **Security** — removed every hardcoded API key and wallet secret from the code and rewrote the git history to drop them; all endpoints and keys now come from `.env`, validated at startup so a bad value fails with a clear message instead of a panic.
 - **Robustness** — Shredstream reconnects with backoff and keeps pending sells; sells use the real on-chain token balance and a fresh blockhash, retry, and a position can never be sold twice; the transaction parser no longer panics on lookup-table or truncated data; the `unwrap()`s on the trading path became proper errors.
 - **Dashboard** — a web panel (Svelte 5, Tailwind, uPlot) and a terminal UI (`ratatui`) sharing one live state, with pause, manual sell and runtime settings. The trading loop only publishes events and never waits for the UI. The API is localhost-only and token-protected.
+- **Buy rule** — only new coins, and only once they show an active community (unique buyers and SOL bid within a short window); copy-trade follows the same rule.
 - **Copy-trade** — follow wallets and mirror their Pump.fun buys and sells, with the same risk checks, one position per token, and a safety exit.
 - **Risk limits** — position, spend and drawdown caps, balance reserve, creator and keyword filters, creator launch-buy range, and configurable buy slippage; every refusal is shown with its reason.
 - **Fix** — the Pump.fun buy asked for the wrong number of tokens whenever the price was not close to the launch price (it multiplied by the price instead of dividing), so the buy could fail on-chain; it now sizes from the reference buy's own price.

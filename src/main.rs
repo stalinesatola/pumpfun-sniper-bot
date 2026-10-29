@@ -11,11 +11,12 @@ use log::{error, info, warn};
 use rustls::crypto::aws_lc_rs::default_provider;
 use rustls::crypto::CryptoProvider;
 use shred_pool_cache::api::{self, ApiConfig};
+use shred_pool_cache::community::{self, CommunityConfig, LastBuy, NewToken};
 use shred_pool_cache::config::Config;
 use shred_pool_cache::copy::{self, CopyConfig};
 use shred_pool_cache::pumpfun::PumpFunSDK;
 use shred_pool_cache::pumpswap::constants::PriorityFeePump;
-use shred_pool_cache::risk::{lamports_to_sol, Candidate, RiskConfig};
+use shred_pool_cache::risk::{lamports_to_sol, RiskConfig};
 use shred_pool_cache::state::{AppState, Settings};
 use shred_pool_cache::trader::Trader;
 use shred_pool_cache::types::*;
@@ -66,6 +67,19 @@ async fn main() -> Result<()> {
     let config = Config::from_env().context("invalid configuration (check your .env)")?;
     let api_config = ApiConfig::from_env().context("invalid API configuration")?;
     let risk = RiskConfig::from_env().context("invalid risk configuration")?;
+    let community_config =
+        CommunityConfig::from_env().context("invalid community configuration")?;
+    if community_config.require_community {
+        info!(
+            "Buy rule: new coins only, bought after {} slots if >= {} unique buyers and >= {} SOL bid; copy-trade follows tokens up to {} slots old (0 = no limit)",
+            community_config.window_slots,
+            community_config.min_buyers,
+            community_config.min_volume_sol,
+            community_config.max_token_age_slots
+        );
+    } else {
+        info!("Buy rule: new coins only, bought as soon as they are created (community check off)");
+    }
     let copy_config =
         CopyConfig::from_env(config.buy_amount_sol).context("invalid copy-trade configuration")?;
     if copy_config.wallets.contains(&config.payer.pubkey()) {
@@ -215,6 +229,7 @@ async fn run_stream(config: &Config, trader: &Trader) -> Result<()> {
         let curr_slot = slot_entry.slot;
         state.set_slot(curr_slot);
         trader.sell_due(curr_slot);
+        community::handle_due(trader, curr_slot);
 
         let entries =
             match bincode::deserialize::<Vec<solana_entry::entry::Entry>>(&slot_entry.entries) {
@@ -228,26 +243,24 @@ async fn run_stream(config: &Config, trader: &Trader) -> Result<()> {
         for entry in &entries {
             for tx in &entry.transactions {
                 let account_keys = tx.message.static_account_keys();
+                let instructions = tx.message.instructions();
+                let blockhash = *tx.message.recent_blockhash();
+
+                // Community: count every buy of the tokens we are watching.
+                for buy in community::pump_buys(account_keys, instructions) {
+                    state.community.observe_buy(&buy, blockhash);
+                }
 
                 // Copy-trade: mirror what the followed wallets do on Pump.fun.
                 if state.copy.enabled() {
-                    if let Some(trade) = copy::leader_trade(
-                        account_keys,
-                        tx.message.instructions(),
-                        &state.copy.wallets,
-                    ) {
-                        copy::handle_leader_trade(
-                            trader,
-                            trade,
-                            curr_slot,
-                            *tx.message.recent_blockhash(),
-                        );
+                    if let Some(trade) =
+                        copy::leader_trade(account_keys, instructions, &state.copy.wallets)
+                    {
+                        copy::handle_leader_trade(trader, trade, curr_slot, blockhash);
                     }
                 }
 
-                let Some(create_ix) = tx
-                    .message
-                    .instructions()
+                let Some(create_ix) = instructions
                     .iter()
                     .find(|ix| is_create_ix(account_keys, ix))
                 else {
@@ -264,93 +277,35 @@ async fn run_stream(config: &Config, trader: &Trader) -> Result<()> {
                         continue;
                     }
                 };
-
-                let buy_amount = match parsed_txn.amounts {
-                    Amounts::BuyAmounts(b) if b.base_amount_out > 0 => b,
-                    _ => {
-                        info!(
-                            "Create TX {} has no usable creator buy, skipping",
-                            signature
-                        );
-                        continue;
-                    }
+                // The fee payer is the wallet that launched the token.
+                let Some(creator_wallet) = account_keys.first().copied() else {
+                    continue;
                 };
 
-                state.record_create(&parsed_txn.mint, &parsed_txn.creator, &signature, curr_slot);
+                state.record_create(&parsed_txn.mint, &creator_wallet, &signature, curr_slot);
 
-                if state.settings.paused() {
-                    info!("Paused: not buying {}", parsed_txn.mint);
-                    continue;
-                }
-
-                // Settings can change from the dashboard at any time; read them per buy.
-                let buy_amount_sol = state.settings.buy_amount_sol();
-                let tip_sol = state.settings.bribe_fee_sol();
-
+                // The creator's own launch buy, if any, is the first price we have.
+                let launch_buy = match parsed_txn.amounts {
+                    Amounts::BuyAmounts(b) if b.base_amount_out > 0 => Some(b),
+                    _ => None,
+                };
                 let meta = parse_create_metadata(&create_ix.data);
-                let candidate = Candidate {
-                    creator: &parsed_txn.creator,
-                    name: meta.as_ref().map(|m| m.0.as_str()),
-                    symbol: meta.as_ref().map(|m| m.1.as_str()),
-                    dev_buy_sol: lamports_to_sol(buy_amount.max_quote_amount_in),
-                };
-                if let Err(reason) =
-                    state
-                        .risk
-                        .check(&candidate, &state.exposure(), buy_amount_sol, tip_sol)
-                {
-                    info!("Skipping {}: {}", parsed_txn.mint, reason);
-                    state.record_skipped(&parsed_txn.mint, &reason);
-                    continue;
-                }
-
-                // Another signal (a followed wallet buying the same token) may already own it.
-                if !state.claim_mint(&parsed_txn.mint, buy_amount_sol) {
-                    state.record_skipped(&parsed_txn.mint, "already holding or buying this token");
-                    continue;
-                }
-
-                let mut sdk = trader.sdk.clone();
-                sdk.priority_fee.jito_tip_fee = tip_sol;
-
-                info!(
-                    "Sniping mint {} (creator {})",
-                    parsed_txn.mint, parsed_txn.creator
-                );
-
-                let swap_res = sdk
-                    .buy(
-                        &parsed_txn.mint,
-                        buy_amount_sol,
-                        trader.payer.insecure_clone(),
-                        parsed_txn.blockhash,
-                        buy_amount,
-                        parsed_txn.creator,
-                        state.risk.buy_slippage_percent,
-                    )
-                    .await;
-
-                match swap_res {
-                    Ok((buy_signature, _estimated_tokens)) => {
-                        info!("Placed PumpFun buy with Signature: {}", buy_signature);
-                        // The sell uses the real on-chain balance, not the buy estimate.
-                        state.record_buy_sent(
-                            &parsed_txn.mint,
-                            &parsed_txn.creator,
-                            &buy_signature,
-                            buy_amount_sol,
-                            curr_slot + state.settings.sell_delay_slots(),
-                        );
-                    }
-                    Err(e) => {
-                        error!("Failed to place PumpFun buy: {}", e);
-                        state.record_buy_failed(&parsed_txn.mint, &e.to_string());
-                    }
-                }
-                state.release_mint(&parsed_txn.mint);
-
-                // One snipe per transaction is enough.
-                break;
+                state.community.track(NewToken {
+                    mint: parsed_txn.mint,
+                    creator_wallet,
+                    creator_vault: launch_buy.map(|_| parsed_txn.creator),
+                    name: meta.as_ref().map(|m| m.0.clone()),
+                    symbol: meta.as_ref().map(|m| m.1.clone()),
+                    dev_buy_sol: launch_buy.map_or(0.0, |b| lamports_to_sol(b.max_quote_amount_in)),
+                    slot: curr_slot,
+                    reference: launch_buy.map(|b| LastBuy {
+                        token_amount: b.base_amount_out,
+                        sol_amount: b.max_quote_amount_in,
+                        blockhash,
+                    }),
+                });
+                // With the community rule off the decision is due right now.
+                community::handle_due(trader, curr_slot);
             }
         }
     }
