@@ -79,13 +79,40 @@ pub fn positive_sol(name: &str, value: f64) -> Result<f64> {
     }
 }
 
-/// Decode a base58 secret key without panicking (`Keypair::from_base58_string` panics).
+/// Reads the wallet key from what a person pastes into `.env`. Accepted: the base58 secret key
+/// (64 bytes, as wallets export it) or the JSON array of numbers that `solana-keygen` writes. Quotes and spaces around it are ignored. Never panics, and the
+/// messages never contain the key.
 pub fn keypair_from_base58(secret: &str) -> Result<Keypair> {
-    let bytes = bs58::decode(secret.trim())
-        .into_vec()
-        .context("PVT_KEY is not valid base58")?;
-    Keypair::try_from(bytes.as_slice())
-        .map_err(|e| anyhow!("PVT_KEY is not a valid 64-byte keypair: {e}"))
+    let text = secret.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    let bytes: Vec<u8> = if text.starts_with('[') {
+        serde_json::from_str(text).map_err(|_| {
+            anyhow!("PVT_KEY looks like a JSON array but is not a list of 64 numbers (0-255)")
+        })?
+    } else {
+        bs58::decode(text).into_vec().map_err(|_| {
+            anyhow!(
+                "PVT_KEY is not base58: paste the private key exactly as the wallet shows it, on one line, \
+                 without quotes or spaces (a seed phrase of words does not work)"
+            )
+        })?
+    };
+    match bytes.len() {
+        64 => Keypair::try_from(bytes.as_slice()).map_err(|_| {
+            anyhow!(
+                "PVT_KEY has 64 bytes but its public half does not match its secret half: the key was \
+                 probably copied with a character missing or changed. Copy it again, or make a new \
+                 wallet (`cargo run --example newkey`)"
+            )
+        }),
+        32 => bail!(
+            "PVT_KEY has only 32 bytes: that is a wallet address (public key) or a seed, and neither can sign. \
+             Use the private key (64 bytes, about 87-88 base58 characters)"
+        ),
+        n => bail!(
+            "PVT_KEY decodes to {n} bytes; a wallet secret key has 64 (about 87-88 base58 characters). \
+             Did you paste the wallet address or part of the key?"
+        ),
+    }
 }
 
 impl Config {
@@ -154,6 +181,56 @@ mod tests {
         assert!(keypair_from_base58("").is_err());
         assert!(keypair_from_base58("not base58 !!!").is_err());
         assert!(keypair_from_base58("abc").is_err());
+    }
+
+    #[test]
+    fn accepted_formats_all_give_the_same_wallet() {
+        let kp = Keypair::new();
+        let b58 = bs58::encode(kp.to_bytes()).into_string();
+        let json = serde_json::to_string(&kp.to_bytes().to_vec()).unwrap();
+        for text in [
+            b58.clone(),
+            format!("  {b58}  "),
+            format!("\"{b58}\""),
+            format!("'{b58}'"),
+            json,
+        ] {
+            assert_eq!(keypair_from_base58(&text).unwrap().pubkey(), kp.pubkey());
+        }
+        // A wallet address (32 bytes) is refused, not turned into a different wallet.
+        let address = kp.pubkey().to_string();
+        let err = keypair_from_base58(&address).unwrap_err().to_string();
+        assert!(err.contains("32 bytes") && err.contains("address"), "{err}");
+    }
+
+    #[test]
+    fn each_mistake_gets_its_own_message_and_never_echoes_the_key() {
+        let kp = Keypair::new();
+        let mut bytes = kp.to_bytes();
+        bytes[40] ^= 0xff; // a changed byte in the public half
+        let mismatched = bs58::encode(bytes).into_string();
+        let err = keypair_from_base58(&mismatched).unwrap_err().to_string();
+        assert!(err.contains("does not match"), "{err}");
+        assert!(!err.contains(&mismatched));
+
+        let wrong_len = bs58::encode([1u8; 40]).into_string();
+        let err = keypair_from_base58(&wrong_len).unwrap_err().to_string();
+        assert!(err.contains("40 bytes"), "{err}");
+
+        let words = "word another word";
+        assert!(keypair_from_base58(words)
+            .unwrap_err()
+            .to_string()
+            .contains("not base58"));
+        assert!(keypair_from_base58("[1,2,3]")
+            .unwrap_err()
+            .to_string()
+            .contains("3 bytes"));
+        assert!(keypair_from_base58("[300, \"x\"]")
+            .unwrap_err()
+            .to_string()
+            .contains("JSON array"));
+        assert!(keypair_from_base58("   ").is_err());
     }
 
     #[test]
