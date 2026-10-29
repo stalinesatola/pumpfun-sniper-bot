@@ -11,7 +11,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use log::{info, warn};
 use rand::Rng;
@@ -21,6 +21,7 @@ use solana_sdk::pubkey::Pubkey;
 use tokio::sync::broadcast::error::RecvError;
 use tower_http::services::ServeDir;
 
+use crate::copy::CopyView;
 use crate::state::{AppState, SettingsUpdate, SettingsView, Snapshot, Stamped};
 use crate::trader::Trader;
 
@@ -128,6 +129,9 @@ pub fn router(app: Arc<AppState>, trader: Trader, token: String, ui_dir: PathBuf
         .route("/api/state", get(get_state))
         .route("/api/settings", post(post_settings))
         .route("/api/pause", post(post_pause))
+        .route("/api/copy", post(post_copy))
+        .route("/api/copy/wallets", post(post_copy_wallet))
+        .route("/api/copy/wallets/{address}", delete(delete_copy_wallet))
         .route("/api/sell/{mint}", post(post_sell))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
@@ -184,6 +188,40 @@ struct PauseBody {
 async fn post_pause(State(st): State<ApiState>, Json(body): Json<PauseBody>) -> Json<SettingsView> {
     st.app.set_paused(body.paused);
     Json(st.app.settings.view())
+}
+
+#[derive(Deserialize)]
+struct CopyBody {
+    enabled: bool,
+}
+
+async fn post_copy(State(st): State<ApiState>, Json(body): Json<CopyBody>) -> Json<CopyView> {
+    Json(st.app.set_copy_enabled(body.enabled))
+}
+
+#[derive(Deserialize)]
+struct WalletBody {
+    address: String,
+}
+
+async fn post_copy_wallet(
+    State(st): State<ApiState>,
+    Json(body): Json<WalletBody>,
+) -> Result<Json<CopyView>, (StatusCode, String)> {
+    st.app
+        .add_copy_wallet(&body.address)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))
+}
+
+async fn delete_copy_wallet(
+    State(st): State<ApiState>,
+    Path(address): Path<String>,
+) -> Result<Json<CopyView>, (StatusCode, String)> {
+    st.app
+        .remove_copy_wallet(&address)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))
 }
 
 async fn post_sell(
@@ -418,5 +456,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn copy_trade_can_be_switched_and_its_wallets_edited() {
+        let (app, state) = app().await;
+        let token = "t".repeat(16);
+        let wallet = Pubkey::new_unique().to_string();
+
+        // Everything needs the token.
+        let res = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/copy",
+                None,
+                Body::from(r#"{"enabled":false}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let res = app
+            .clone()
+            .oneshot(req(
+                "DELETE",
+                &format!("/api/copy/wallets/{wallet}"),
+                None,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Add, with a bad address rejected and the bot's own wallet refused.
+        let add = |body: String| req("POST", "/api/copy/wallets", Some(&token), Body::from(body));
+        let res = app
+            .clone()
+            .oneshot(add(format!(r#"{{"address":"{wallet}"}}"#)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(state.follow.active());
+        assert_eq!(state.follow.list(), vec![wallet.clone()]);
+
+        let res = app
+            .clone()
+            .oneshot(add(r#"{"address":"not-an-address"}"#.into()))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let res = app
+            .clone()
+            .oneshot(add(format!(r#"{{"address":"{}"}}"#, state.wallet())))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.follow.list().len(), 1);
+
+        // Switch off and on.
+        let res = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/copy",
+                Some(&token),
+                Body::from(r#"{"enabled":false}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(!state.follow.active() && !state.follow.enabled());
+        let res = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/copy",
+                Some(&token),
+                Body::from(r#"{"enabled":true}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(state.follow.active());
+
+        // Remove, and the snapshot reflects it.
+        let res = app
+            .clone()
+            .oneshot(req(
+                "DELETE",
+                &format!("/api/copy/wallets/{wallet}"),
+                Some(&token),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(state.follow.list().is_empty());
+        let res = app
+            .oneshot(req(
+                "DELETE",
+                "/api/copy/wallets/garbage",
+                Some(&token),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(!state.snapshot().copy.active);
     }
 }

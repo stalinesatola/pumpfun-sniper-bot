@@ -21,13 +21,16 @@ use solana_sdk::signer::Signer;
 async fn main() -> anyhow::Result<()> {
     let tui = std::env::args().any(|a| a == "--tui");
     let payer = Keypair::new();
-    let leader = Pubkey::new_unique();
     let copy = CopyConfig {
-        wallets: [leader].into_iter().collect(),
+        wallets: [Pubkey::new_unique()].into_iter().collect(),
         ..CopyConfig::default()
     };
-    let state =
-        Arc::new(AppState::new(payer.pubkey(), Settings::new(0.001, 0.001, 7)).with_copy(copy));
+    let mut state = AppState::new(payer.pubkey(), Settings::new(0.001, 0.001, 7)).with_copy(copy);
+    // COPY_STATE_FILE=<path> makes the demo save the followed wallets like the real bot does.
+    if let Ok(path) = std::env::var("COPY_STATE_FILE") {
+        state = state.with_copy_store(path.into());
+    }
+    let state = Arc::new(state);
     // Nothing listens here; the demo simulates every trade itself.
     let sdk = PumpFunSDK::new(
         "http://127.0.0.1:1",
@@ -84,29 +87,34 @@ async fn main() -> anyhow::Result<()> {
                         lamports = lamports.saturating_sub((sol * 1e9) as u64);
                     }
                 }
-                // A followed wallet buys now and then; we mirror it.
-                if tick % 14 == 5 && !state.settings.paused() {
-                    let mint = Pubkey::new_unique();
-                    let trade = LeaderTrade {
-                        side: Side::Buy,
-                        leader,
-                        mint,
-                        creator_vault: Pubkey::new_unique(),
-                        token_amount: 1_000_000,
-                        sol_amount: 1_500_000_000,
-                    };
-                    state.record_copy_signal(&trade, slot);
-                    state.record_buy_sent_from(
-                        &mint,
-                        &trade.creator_vault,
-                        "demo-copy-signature",
-                        0.001,
-                        slot + 12,
-                        PositionSource::Copy {
-                            leader: leader.to_string(),
-                        },
-                    );
-                    lamports = lamports.saturating_sub(1_000_000);
+                // A followed wallet buys now and then; we mirror it. Only while copy-trade is
+                // on, and only for the wallets currently in the list (edit them in the dashboard).
+                let followed = state.follow.wallets();
+                let leader = followed.iter().next().copied();
+                if let Some(leader) = leader.filter(|_| state.follow.active()) {
+                    if tick % 14 == 5 && !state.settings.paused() {
+                        let mint = Pubkey::new_unique();
+                        let trade = LeaderTrade {
+                            side: Side::Buy,
+                            leader,
+                            mint,
+                            creator_vault: Pubkey::new_unique(),
+                            token_amount: 1_000_000,
+                            sol_amount: 1_500_000_000,
+                        };
+                        state.record_copy_signal(&trade, slot);
+                        state.record_buy_sent_from(
+                            &mint,
+                            &trade.creator_vault,
+                            "demo-copy-signature",
+                            0.001,
+                            slot + 12,
+                            PositionSource::Copy {
+                                leader: leader.to_string(),
+                            },
+                        );
+                        lamports = lamports.saturating_sub(1_000_000);
+                    }
                 }
                 if tick % 18 == 9 {
                     state.record_skipped(

@@ -151,11 +151,16 @@ What this does and does not tell you:
 
 ### Copy-trade
 
-Set `COPY_WALLETS` (comma-separated addresses) and the bot also watches those wallets on the same Shredstream feed. When one of them **buys** on the Pump.fun bonding curve, the bot buys the same token with a fixed amount; when it **sells** a token you copied, the bot sells yours. Leave `COPY_WALLETS` empty to turn it off.
+Copy-trade has an **on/off switch and a wallet list you edit in the dashboard** (the *Copy-trade* card: *Turn on / Turn off*, a field to add an address, *Remove* per wallet). Changes apply immediately, no restart. In the terminal UI, `c` switches it on and off.
+
+When it is on and at least one wallet is followed, the bot also watches those wallets on the same Shredstream feed. When one of them **buys** on the Pump.fun bonding curve, the bot buys the same token with a fixed amount; when it **sells** a token you copied, the bot sells yours.
+
+The list is saved to `copy_trade.json` (`COPY_STATE_FILE`, `off` = memory only), so what you set in the dashboard survives a restart. Once that file exists it **replaces** `COPY_WALLETS` from the `.env`, which is only the starting list for the first run. Switching off keeps the list; copies you already hold still sell on the timer (`COPY_MAX_HOLD_SLOTS`), but while it is off the bot no longer sees the leader's sells.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `COPY_WALLETS` | none (off) | Wallets to follow |
+| `COPY_WALLETS` | none | Wallets to follow at the first start (afterwards the dashboard list in `COPY_STATE_FILE` is used) |
+| `COPY_STATE_FILE` | `copy_trade.json` | Where the dashboard saves the list and the switch; `off` keeps them in memory only |
 | `COPY_BUY_SOL` | `SOL_BUY_AMOUNT` | SOL spent per copied buy, whatever the leader spent |
 | `COPY_MIN_LEADER_SOL` / `COPY_MAX_LEADER_SOL` | off | Ignore leader buys smaller / larger than this |
 | `COPY_SELL_WITH_LEADER` | `true` | Sell when the leader sells the same token |
@@ -167,7 +172,8 @@ Things to know:
 - Only **Pump.fun bonding-curve** trades of **new** tokens are copied (see the buy rule above), not PumpSwap, and only transactions whose accounts are listed directly (not through address lookup tables).
 - The leader's "size" is the SOL cap in their instruction, which includes their own slippage allowance, not necessarily what they paid.
 - Your buy lands *after* the leader's, so you pay a higher price. The price used for sizing is the leader's own maximum price; keep `BUY_SLIPPAGE_PERCENT` high enough for your buy to still land.
-- The bot refuses to start if `COPY_WALLETS` contains its own wallet.
+- The bot never follows its own wallet (refused at startup and in the dashboard).
+- The dashboard API is the only way to edit the list; anyone with the API token can change who you copy, so keep the token secret and the API on localhost.
 - Leaders can be wrong, or bait followers. Start with a small `COPY_BUY_SOL` and tight risk limits.
 
 The sell reads the real token balance on-chain and uses a fresh blockhash, retrying a few times. If the buy never landed there is nothing to sell and the position is dropped with a log line. If the Shredstream connection drops, the bot reconnects with backoff and keeps its pending sells.
@@ -204,7 +210,7 @@ Customising the look: colours and fonts are tokens at the top of `ui/src/app.css
 cargo run --release -- --tui
 ```
 
-Keys: `↑/↓` select, `s` sell the selected position, `p` pause/resume, `q` quit. Logs go to `sniper.log` while the TUI is open. Build without it using `--no-default-features`.
+Keys: `↑/↓` select, `s` sell the selected position, `p` pause/resume, `c` copy-trade on/off, `q` quit. Logs go to `sniper.log` while the TUI is open. Build without it using `--no-default-features`.
 
 **Try it without a wallet:** `cargo run --example demo` (add `-- --tui`) runs both interfaces on simulated activity.
 
@@ -232,7 +238,7 @@ This project started as [dexoryn](https://github.com/dexoryn)'s sniper; the cred
 - **Robustness** — Shredstream reconnects with backoff and keeps pending sells; sells use the real on-chain token balance and a fresh blockhash, retry, and a position can never be sold twice; the transaction parser no longer panics on lookup-table or truncated data; the `unwrap()`s on the trading path became proper errors.
 - **Dashboard** — a web panel (Svelte 5, Tailwind, uPlot) and a terminal UI (`ratatui`) sharing one live state, with pause, manual sell and runtime settings. The trading loop only publishes events and never waits for the UI. The API is localhost-only and token-protected.
 - **Buy rule** — only new coins, and only once they show an active community (unique buyers and SOL bid within a short window); copy-trade follows the same rule.
-- **Copy-trade** — follow wallets and mirror their Pump.fun buys and sells, with the same risk checks, one position per token, and a safety exit.
+- **Copy-trade** — follow wallets and mirror their Pump.fun buys and sells, with the same risk checks, one position per token, and a safety exit; switch it on/off and edit the followed wallets from the dashboard, with the list saved across restarts.
 - **Risk limits** — position, spend and drawdown caps, balance reserve, creator and keyword filters, creator launch-buy range, and configurable buy slippage; every refusal is shown with its reason.
 - **Fix** — the Pump.fun buy asked for the wrong number of tokens whenever the price was not close to the launch price (it multiplied by the price instead of dividing), so the buy could fail on-chain; it now sizes from the reference buy's own price.
 - **Dependencies and tooling** — migrated to Solana SDK 3.x on Rust 1.89, with byte-for-byte golden tests of the transactions and the Shredstream entry format captured before the upgrade; known vulnerabilities in the dependency tree went from 41 to 3 (all `zstd`, upstream); unused dependencies removed; `dotenv` replaced by `dotenvy`.

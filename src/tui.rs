@@ -107,6 +107,14 @@ fn describe(e: &Stamped) -> (Color, String) {
             Color::Yellow,
             format!("bot       {}", if *paused { "PAUSED" } else { "running" }),
         ),
+        Event::CopyChanged { copy } => (
+            Color::Cyan,
+            format!(
+                "copy      {} ({} wallet(s))",
+                if copy.enabled { "on" } else { "off" },
+                copy.wallets.len()
+            ),
+        ),
         Event::SettingsChanged { settings } => (
             Color::Cyan,
             format!(
@@ -156,10 +164,15 @@ fn draw(f: &mut Frame, snap: &Snapshot, table: &mut TableState) {
             ]),
             Line::from(format!("wallet {}  balance {balance}", short(&snap.wallet))),
             Line::from(format!(
-                "buy {} SOL   tip {} SOL   sell after {} slots",
+                "buy {} SOL   tip {} SOL   sell after {} slots   copy-trade {}",
                 snap.settings.buy_amount_sol,
                 snap.settings.bribe_fee_sol,
-                snap.settings.sell_delay_slots
+                snap.settings.sell_delay_slots,
+                match (snap.copy.enabled, snap.copy.wallets.len()) {
+                    (false, _) => "off".to_string(),
+                    (true, 0) => "on (no wallets)".to_string(),
+                    (true, n) => format!("on ({n} wallet{})", if n == 1 { "" } else { "s" }),
+                }
             )),
             Line::from(format!(
                 "spent {:.4} SOL (cap {})   drawdown {}   slippage {}%",
@@ -242,8 +255,10 @@ fn draw(f: &mut Frame, snap: &Snapshot, table: &mut TableState) {
     );
 
     f.render_widget(
-        Paragraph::new("↑/↓ select   s sell selected   p pause/resume   q quit")
-            .style(Style::new().fg(Color::DarkGray)),
+        Paragraph::new(
+            "↑/↓ select   s sell selected   p pause/resume   c copy-trade on/off   q quit",
+        )
+        .style(Style::new().fg(Color::DarkGray)),
         footer,
     );
 }
@@ -309,6 +324,9 @@ fn event_loop(
                 ));
             }
             KeyCode::Char('p') => state.set_paused(!snap.settings.paused),
+            KeyCode::Char('c') => {
+                state.set_copy_enabled(!snap.copy.enabled);
+            }
             KeyCode::Char('s') => {
                 // The table shows newest first.
                 let selected = table

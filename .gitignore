@@ -3,3 +3,5 @@
 sniper.log
 ui/node_modules
 ui/dist
+copy_trade.json
+copy_trade.json.tmp

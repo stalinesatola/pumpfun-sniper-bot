@@ -9,7 +9,7 @@ use tokio::sync::broadcast;
 
 use crate::community::{CommunityConfig, CommunityTracker, CommunityView};
 use crate::config::{positive_sol, Config};
-use crate::copy::{CopyConfig, CopyView, LeaderTrade, Side};
+use crate::copy::{CopyConfig, CopyFollow, CopyView, LeaderTrade, Side};
 use crate::risk::{lamports_to_sol, Exposure, RiskConfig, RiskView};
 
 const MAX_RECENT_EVENTS: usize = 200;
@@ -96,6 +96,9 @@ pub enum Event {
     },
     Paused {
         paused: bool,
+    },
+    CopyChanged {
+        copy: CopyView,
     },
     SettingsChanged {
         settings: SettingsView,
@@ -275,6 +278,8 @@ pub struct AppState {
     pub settings: Settings,
     pub risk: RiskConfig,
     pub copy: CopyConfig,
+    /// Followed wallets and the on/off switch, editable while the bot runs.
+    pub follow: CopyFollow,
     pub community: CommunityTracker,
     /// Mints a buy is currently being sent for, so two signals cannot both buy one token.
     /// SOL reserved per mint for buys being sent, counted by [`Self::exposure`].
@@ -300,6 +305,7 @@ impl AppState {
             settings,
             risk: RiskConfig::default(),
             copy: CopyConfig::default(),
+            follow: CopyFollow::new(Default::default(), wallet),
             community: CommunityTracker::new(CommunityConfig::default()),
             inflight: Mutex::new(HashMap::new()),
             wallet: wallet.to_string(),
@@ -317,6 +323,27 @@ impl AppState {
         }
     }
 
+    /// The state the bot runs with: every setting read from the environment goes through
+    /// here, and `main` logs what it finds *in the state*, so a setting that is parsed but
+    /// never applied cannot go unnoticed.
+    pub fn configured(
+        wallet: Pubkey,
+        settings: Settings,
+        risk: RiskConfig,
+        copy: CopyConfig,
+        community: CommunityConfig,
+        copy_store: Option<std::path::PathBuf>,
+    ) -> Self {
+        let state = Self::new(wallet, settings)
+            .with_risk(risk)
+            .with_community(community)
+            .with_copy(copy);
+        match copy_store {
+            Some(path) => state.with_copy_store(path),
+            None => state,
+        }
+    }
+
     pub fn with_risk(mut self, risk: RiskConfig) -> Self {
         self.risk = risk;
         self
@@ -327,9 +354,48 @@ impl AppState {
         self
     }
 
+    /// Sets the copy-trade parameters; `copy.wallets` is the list followed at startup.
     pub fn with_copy(mut self, copy: CopyConfig) -> Self {
+        let own = self.wallet_key();
+        self.follow = CopyFollow::new(copy.wallets.clone(), own);
         self.copy = copy;
         self
+    }
+
+    /// Keeps the followed wallets in `path` so changes made from the dashboard survive a
+    /// restart. An existing file replaces the startup list. Call after [`Self::with_copy`].
+    pub fn with_copy_store(mut self, path: std::path::PathBuf) -> Self {
+        self.follow.attach_store(path);
+        self
+    }
+
+    fn wallet_key(&self) -> Pubkey {
+        self.wallet.parse().unwrap_or_default()
+    }
+
+    pub fn copy_view(&self) -> CopyView {
+        self.copy.view(&self.follow)
+    }
+
+    pub fn set_copy_enabled(&self, enabled: bool) -> CopyView {
+        self.follow.set_enabled(enabled);
+        self.publish_copy()
+    }
+
+    pub fn add_copy_wallet(&self, address: &str) -> Result<CopyView, String> {
+        self.follow.add_wallet(address)?;
+        Ok(self.publish_copy())
+    }
+
+    pub fn remove_copy_wallet(&self, address: &str) -> Result<CopyView, String> {
+        self.follow.remove_wallet(address)?;
+        Ok(self.publish_copy())
+    }
+
+    fn publish_copy(&self) -> CopyView {
+        let view = self.copy_view();
+        self.publish(Event::CopyChanged { copy: view.clone() });
+        view
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Stamped> {
@@ -641,7 +707,7 @@ impl AppState {
             uptime_secs: self.started.elapsed().as_secs(),
             settings: self.settings.view(),
             risk: self.risk.view(),
-            copy: self.copy.view(),
+            copy: self.copy_view(),
             community: self.community.view(),
             session_spent_sol: self.session_spent_sol(),
             drawdown_sol: match (self.start_balance_lamports(), self.balance_lamports()) {
@@ -879,5 +945,82 @@ mod tests {
         assert_eq!(json["type"], "balance");
         assert_eq!(json["lamports"], 42);
         assert!(json["ts_ms"].is_u64());
+    }
+
+    #[test]
+    fn every_configured_setting_reaches_the_running_state() {
+        // The settings read from the environment must be what the bot actually runs with.
+        let own = Pubkey::new_unique();
+        let leader = Pubkey::new_unique();
+        let risk = RiskConfig {
+            max_open_positions: 7,
+            max_session_spend_sol: 3.5,
+            buy_slippage_percent: 11,
+            ..RiskConfig::default()
+        };
+        let copy = CopyConfig {
+            wallets: [leader].into_iter().collect(),
+            buy_sol: 0.25,
+            max_hold_slots: 99,
+            ..CopyConfig::default()
+        };
+        let community = CommunityConfig {
+            window_slots: 13,
+            min_buyers: 9,
+            ..CommunityConfig::default()
+        };
+        let state = AppState::configured(
+            own,
+            Settings::new(0.001, 0.001, 7),
+            risk,
+            copy,
+            community,
+            None,
+        );
+
+        let snap = state.snapshot();
+        assert_eq!(snap.risk.max_open_positions, 7);
+        assert_eq!(snap.risk.max_session_spend_sol, 3.5);
+        assert_eq!(snap.risk.buy_slippage_percent, 11);
+        assert_eq!(snap.copy.wallets, vec![leader.to_string()]);
+        assert!(snap.copy.active);
+        assert_eq!(snap.copy.buy_sol, 0.25);
+        assert_eq!(snap.copy.max_hold_slots, 99);
+        assert_eq!(snap.community.window_slots, 13);
+        assert_eq!(snap.community.min_buyers, 9);
+        assert!(state.follow.wallets().contains(&leader));
+        assert!(state.follow.add_wallet(&own.to_string()).is_err());
+    }
+
+    #[test]
+    fn copy_changes_are_published_to_the_dashboard() {
+        let st = state();
+        let mut rx = st.subscribe();
+        let w = Pubkey::new_unique().to_string();
+
+        let view = st.add_copy_wallet(&w).unwrap();
+        assert!(view.active && view.wallets == vec![w.clone()]);
+        let view = st.set_copy_enabled(false);
+        assert!(
+            !view.enabled && !view.active,
+            "switched off means not active"
+        );
+        assert!(!st.copy_view().enabled);
+        assert!(st.remove_copy_wallet(&w).unwrap().wallets.is_empty());
+        assert!(
+            st.add_copy_wallet("nope").is_err(),
+            "a bad address publishes nothing"
+        );
+
+        let mut changes = 0;
+        while let Ok(e) = rx.try_recv() {
+            if matches!(e.event, Event::CopyChanged { .. }) {
+                changes += 1;
+            }
+        }
+        assert_eq!(changes, 3);
+        let json = serde_json::to_value(&st.snapshot().recent.last().unwrap().event).unwrap();
+        assert_eq!(json["type"], "copy_changed");
+        assert_eq!(json["copy"]["enabled"], false);
     }
 }
