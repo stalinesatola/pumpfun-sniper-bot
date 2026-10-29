@@ -1,17 +1,22 @@
 use std::collections::HashSet;
 use std::env;
+use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use anyhow::{bail, Result};
 use log::info;
-use serde::Serialize;
+use log::warn;
+use serde::{Deserialize, Serialize};
 use solana_sdk::hash::Hash;
 use solana_sdk::message::compiled_instruction::CompiledInstruction;
 use solana_sdk::pubkey::Pubkey;
 
 use crate::config::{optional_parsed, positive_sol};
+use crate::persist::{self, Loaded};
 use crate::risk::{lamports_to_sol, Candidate};
-use crate::state::{PositionSource, MAX_BUY_AMOUNT_SOL};
+use crate::state::{PositionSource, TradingMode, MAX_BUY_AMOUNT_SOL};
 use crate::trader::{BuyRequest, Trader};
 use crate::types::{BuyAmounts, PUMP_FUN_PROGRAM_ID, PUMP_ORDER_BUY, PUMP_ORDER_SELL};
 
@@ -20,6 +25,8 @@ const MAX_HOLD_SLOTS_LIMIT: u64 = 2_000;
 /// Copy-trade settings. Disabled unless `COPY_WALLETS` lists at least one wallet.
 #[derive(Clone, Debug)]
 pub struct CopyConfig {
+    /// Wallets to follow at startup (`COPY_WALLETS`). After that the list lives in
+    /// [`CopyFollow`], which the dashboard edits.
     pub wallets: HashSet<Pubkey>,
     /// SOL spent per copied buy, whatever the leader spent.
     pub buy_sol: f64,
@@ -47,13 +54,20 @@ impl Default for CopyConfig {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CopyView {
+    /// The on/off switch (set from the dashboard).
     pub enabled: bool,
-    pub wallets: usize,
+    /// On and at least one wallet followed: copy-trade is actually running.
+    pub active: bool,
+    pub wallets: Vec<String>,
     pub buy_sol: f64,
     pub min_leader_sol: f64,
     pub max_leader_sol: f64,
     pub sell_with_leader: bool,
     pub max_hold_slots: u64,
+    /// Where the wallet list is saved, if it is.
+    pub persisted: bool,
+    /// Set when the last attempt to save the list failed (the change is still in effect).
+    pub save_error: Option<String>,
 }
 
 impl CopyConfig {
@@ -105,19 +119,18 @@ impl CopyConfig {
         Ok(())
     }
 
-    pub fn enabled(&self) -> bool {
-        !self.wallets.is_empty()
-    }
-
-    pub fn view(&self) -> CopyView {
+    pub fn view(&self, follow: &CopyFollow) -> CopyView {
         CopyView {
-            enabled: self.enabled(),
-            wallets: self.wallets.len(),
+            enabled: follow.enabled(),
+            active: follow.active(),
+            wallets: follow.list(),
             buy_sol: self.buy_sol,
             min_leader_sol: self.min_leader_sol,
             max_leader_sol: self.max_leader_sol,
             sell_with_leader: self.sell_with_leader,
             max_hold_slots: self.max_hold_slots,
+            persisted: follow.persisted(),
+            save_error: follow.save_error(),
         }
     }
 
@@ -136,6 +149,195 @@ impl CopyConfig {
             ));
         }
         Ok(())
+    }
+}
+
+/// Most wallets that can be followed at once.
+pub const MAX_FOLLOWED_WALLETS: usize = 50;
+
+#[derive(Serialize, Deserialize)]
+struct SavedFollow {
+    enabled: bool,
+    wallets: Vec<String>,
+}
+
+/// The wallets being followed and the on/off switch. Unlike the rest of [`CopyConfig`] this
+/// changes while the bot runs (from the dashboard), so it is shared and thread-safe. Reading
+/// it is cheap: the stream loop takes one `Arc` snapshot per message.
+pub struct CopyFollow {
+    enabled: AtomicBool,
+    wallets: RwLock<Arc<HashSet<Pubkey>>>,
+    /// The bot's own wallet, which can never be followed (it would copy itself).
+    own: Pubkey,
+    store: Option<PathBuf>,
+    save_error: Mutex<Option<String>>,
+}
+
+fn lock_err(m: &Mutex<Option<String>>) -> MutexGuard<'_, Option<String>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl CopyFollow {
+    pub fn new(wallets: HashSet<Pubkey>, own: Pubkey) -> Self {
+        Self {
+            enabled: AtomicBool::new(true),
+            wallets: RwLock::new(Arc::new(wallets)),
+            own,
+            store: None,
+            save_error: Mutex::new(None),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Switch on and at least one wallet followed.
+    pub fn active(&self) -> bool {
+        self.enabled() && !self.wallets().is_empty()
+    }
+
+    pub fn persisted(&self) -> bool {
+        self.store.is_some()
+    }
+
+    pub fn save_error(&self) -> Option<String> {
+        lock_err(&self.save_error).clone()
+    }
+
+    /// A snapshot of the followed wallets; later changes do not affect it.
+    pub fn wallets(&self) -> Arc<HashSet<Pubkey>> {
+        self.wallets
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The followed wallets as base58, sorted, for display.
+    pub fn list(&self) -> Vec<String> {
+        let mut list: Vec<String> = self.wallets().iter().map(|k| k.to_string()).collect();
+        list.sort();
+        list
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+        self.save();
+    }
+
+    /// Parses and validates an address typed by a person.
+    pub fn parse_wallet(&self, text: &str) -> Result<Pubkey, String> {
+        let text = text.trim();
+        let key = Pubkey::from_str(text).map_err(|_| {
+            "not a valid Solana address (expected base58, 32-44 characters)".to_string()
+        })?;
+        if key == self.own {
+            return Err("that is this bot's own wallet; it cannot copy itself".into());
+        }
+        Ok(key)
+    }
+
+    /// Adds a wallet. Adding one that is already followed is not an error.
+    pub fn add_wallet(&self, text: &str) -> Result<Pubkey, String> {
+        let key = self.parse_wallet(text)?;
+        {
+            let mut guard = self.wallets.write().unwrap_or_else(|e| e.into_inner());
+            if !guard.contains(&key) {
+                if guard.len() >= MAX_FOLLOWED_WALLETS {
+                    return Err(format!(
+                        "at most {MAX_FOLLOWED_WALLETS} wallets can be followed"
+                    ));
+                }
+                let mut next = (**guard).clone();
+                next.insert(key);
+                *guard = Arc::new(next);
+            }
+        }
+        self.save();
+        Ok(key)
+    }
+
+    /// Removes a wallet. Returns whether it was being followed.
+    pub fn remove_wallet(&self, text: &str) -> Result<bool, String> {
+        let key =
+            Pubkey::from_str(text.trim()).map_err(|_| "not a valid Solana address".to_string())?;
+        let removed = {
+            let mut guard = self.wallets.write().unwrap_or_else(|e| e.into_inner());
+            if guard.contains(&key) {
+                let mut next = (**guard).clone();
+                next.remove(&key);
+                *guard = Arc::new(next);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.save();
+        }
+        Ok(removed)
+    }
+
+    /// Saves the list to `path` from now on. If the file already exists it replaces the
+    /// startup list and switch, so what was set in the dashboard survives a restart. A file
+    /// that cannot be read is ignored (and kept as it is until the next change).
+    pub fn attach_store(&mut self, path: PathBuf) {
+        match persist::read_json::<SavedFollow>(&path) {
+            Loaded::Value(saved) => {
+                let mut wallets = HashSet::new();
+                for w in &saved.wallets {
+                    match self.parse_wallet(w) {
+                        Ok(k) => {
+                            wallets.insert(k);
+                        }
+                        Err(e) => warn!("Ignoring `{w}` in {}: {e}", path.display()),
+                    }
+                }
+                wallets.truncate_to(MAX_FOLLOWED_WALLETS);
+                *self.wallets.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(wallets);
+                self.enabled.store(saved.enabled, Ordering::Relaxed);
+            }
+            Loaded::Missing => {}
+            Loaded::Unreadable(e) => warn!(
+                "Could not read {}: {e}; using the startup list",
+                path.display()
+            ),
+        }
+        self.store = Some(path);
+    }
+
+    /// Writes the current list (atomically) and remembers whether that worked.
+    fn save(&self) {
+        let Some(path) = &self.store else {
+            return;
+        };
+        let saved = SavedFollow {
+            enabled: self.enabled(),
+            wallets: self.list(),
+        };
+        let result = persist::write_json(path, &saved);
+        *lock_err(&self.save_error) = match result {
+            Ok(()) => None,
+            Err(e) => {
+                warn!("Could not save {}: {e}", path.display());
+                Some(format!("could not save {}: {e}", path.display()))
+            }
+        };
+    }
+}
+
+trait TruncateTo {
+    fn truncate_to(&mut self, max: usize);
+}
+
+impl TruncateTo for HashSet<Pubkey> {
+    fn truncate_to(&mut self, max: usize) {
+        while self.len() > max {
+            let Some(k) = self.iter().next().copied() else {
+                break;
+            };
+            self.remove(&k);
+        }
     }
 }
 
@@ -241,6 +443,10 @@ pub fn handle_leader_trade(trader: &Trader, trade: LeaderTrade, slot: u64, block
     match trade.side {
         Side::Sell => {
             if copy.sell_with_leader && state.is_copy_held(&trade.mint) {
+                if !state.settings.mode().allows_sells() {
+                    state.record_skipped(&trade.mint, TradingMode::SELL_REFUSED);
+                    return;
+                }
                 info!(
                     "Leader {} sold {}: selling our copy",
                     trade.leader, trade.mint
@@ -265,6 +471,9 @@ fn copy_buy(trader: &Trader, trade: LeaderTrade, slot: u64, blockhash: Hash) {
 
     if state.settings.paused() {
         return skip("bot is paused".into());
+    }
+    if !state.settings.mode().allows_buys() {
+        return skip(TradingMode::BUY_REFUSED.into());
     }
     if trade.token_amount == 0 || trade.sol_amount == 0 {
         return skip("leader instruction has a zero amount".into());
@@ -435,10 +644,8 @@ mod tests {
     fn config_validation_and_size_filter() {
         let mut cfg = CopyConfig::default();
         assert!(cfg.validate().is_ok());
-        assert!(!cfg.enabled());
 
         cfg.wallets.insert(key(1));
-        assert!(cfg.enabled());
         cfg.min_leader_sol = 0.5;
         cfg.max_leader_sol = 2.0;
         assert!(cfg.check_leader_size(0.1).unwrap_err().contains("below"));
@@ -824,5 +1031,180 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(attempted, "the copy buy was never attempted");
+    }
+
+    // ---- CopyFollow: the list and switch the dashboard edits ----
+
+    const OWN: u8 = 250;
+
+    fn follow() -> CopyFollow {
+        CopyFollow::new(HashSet::new(), key(OWN))
+    }
+
+    #[test]
+    fn follow_adds_removes_and_validates_wallets() {
+        let f = follow();
+        assert!(!f.active(), "nothing followed yet");
+        assert!(f.enabled());
+
+        let a = key(1).to_string();
+        assert_eq!(
+            f.add_wallet(&format!("  {a}  ")),
+            Ok(key(1)),
+            "whitespace is trimmed"
+        );
+        assert_eq!(f.add_wallet(&a), Ok(key(1)), "adding twice is harmless");
+        assert_eq!(f.list(), vec![a.clone()]);
+        assert!(f.active());
+
+        assert!(f.add_wallet("").unwrap_err().contains("valid"));
+        assert!(f
+            .add_wallet("not-an-address")
+            .unwrap_err()
+            .contains("valid"));
+        assert!(f
+            .add_wallet(&key(OWN).to_string())
+            .unwrap_err()
+            .contains("own wallet"));
+        assert_eq!(f.list().len(), 1);
+
+        assert_eq!(f.remove_wallet(&a), Ok(true));
+        assert_eq!(f.remove_wallet(&a), Ok(false), "already gone");
+        assert!(f.remove_wallet("x").is_err());
+        assert!(!f.active());
+    }
+
+    #[test]
+    fn follow_is_active_only_when_switched_on_with_wallets() {
+        let f = follow();
+        f.add_wallet(&key(1).to_string()).unwrap();
+        assert!(f.active());
+        f.set_enabled(false);
+        assert!(!f.active());
+        assert!(!f.enabled());
+        assert_eq!(f.list().len(), 1, "switching off keeps the list");
+        f.set_enabled(true);
+        assert!(f.active());
+    }
+
+    #[test]
+    fn follow_caps_the_number_of_wallets_and_snapshots_are_stable() {
+        let f = follow();
+        for n in 0..MAX_FOLLOWED_WALLETS as u8 {
+            f.add_wallet(&key(n).to_string()).unwrap();
+        }
+        let before = f.wallets();
+        assert!(f
+            .add_wallet(&key(200).to_string())
+            .unwrap_err()
+            .contains("at most"));
+        // Re-adding one that is already there still works at the cap.
+        assert!(f.add_wallet(&key(0).to_string()).is_ok());
+
+        f.remove_wallet(&key(0).to_string()).unwrap();
+        assert_eq!(
+            before.len(),
+            MAX_FOLLOWED_WALLETS,
+            "an earlier snapshot never changes"
+        );
+        assert_eq!(f.wallets().len(), MAX_FOLLOWED_WALLETS - 1);
+    }
+
+    fn temp_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sniper-test-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("copy_trade.json")
+    }
+
+    #[test]
+    fn follow_saves_and_reloads_across_restarts() {
+        let path = temp_file("roundtrip");
+        let _ = std::fs::remove_file(&path);
+
+        let mut first = follow();
+        first.add_wallet(&key(9).to_string()).unwrap(); // startup list, before the file exists
+        first.attach_store(path.clone());
+        assert!(first.persisted());
+        first.add_wallet(&key(1).to_string()).unwrap();
+        first.add_wallet(&key(2).to_string()).unwrap();
+        first.remove_wallet(&key(9).to_string()).unwrap();
+        first.set_enabled(false);
+        assert!(first.save_error().is_none());
+
+        // "Restart": a new bot with a different startup list; the saved file wins.
+        let mut second = CopyFollow::new([key(77)].into_iter().collect(), key(OWN));
+        second.attach_store(path.clone());
+        assert_eq!(second.list().len(), 2);
+        assert!(second.wallets().contains(&key(1)) && second.wallets().contains(&key(2)));
+        assert!(
+            !second.wallets().contains(&key(77)),
+            "startup list is replaced by the file"
+        );
+        assert!(!second.enabled(), "the switch is restored too");
+
+        // No stray temp file is left behind.
+        assert!(!path.with_extension("json.tmp").exists());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn follow_survives_bad_or_hostile_files_and_unwritable_paths() {
+        // A corrupt file is ignored and the startup list is kept.
+        let path = temp_file("corrupt");
+        std::fs::write(&path, "{ not json").unwrap();
+        let mut f = CopyFollow::new([key(5)].into_iter().collect(), key(OWN));
+        f.attach_store(path.clone());
+        assert_eq!(f.list(), vec![key(5).to_string()]);
+
+        // Invalid addresses and the bot's own wallet inside a file are dropped, the rest kept.
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"enabled":true,"wallets":["{}","garbage","{}"]}}"#,
+                key(6),
+                key(OWN)
+            ),
+        )
+        .unwrap();
+        let mut g = follow();
+        g.attach_store(path.clone());
+        assert_eq!(g.list(), vec![key(6).to_string()]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        // Cannot write: the change still applies in memory and the error is reported.
+        let mut h = follow();
+        h.attach_store(PathBuf::from("/nonexistent-dir-for-test/copy_trade.json"));
+        h.add_wallet(&key(1).to_string()).unwrap();
+        assert!(h.active());
+        assert!(h.save_error().unwrap().contains("could not save"));
+    }
+
+    #[tokio::test]
+    async fn the_trading_mode_gates_copy_buys_and_leader_sells() {
+        let bh = Hash::default();
+
+        // Sell-only: a leader buy is not copied.
+        let t = trader(cfg()).await;
+        t.state.set_mode(TradingMode::SellOnly);
+        handle_leader_trade(&t, trade(Side::Buy, key(140), 1_000_000_000), 100, bh);
+        assert!(has_skip(&t, "sell-only"));
+
+        // Buy-only: we keep a copy when the leader sells.
+        let t = trader(cfg()).await;
+        let copied = key(141);
+        t.state.record_buy_sent_from(
+            &copied,
+            &key(10),
+            "sig",
+            0.001,
+            999,
+            PositionSource::Copy {
+                leader: key(7).to_string(),
+            },
+        );
+        t.state.set_mode(TradingMode::BuyOnly);
+        handle_leader_trade(&t, trade(Side::Sell, copied, 1_000_000), 100, bh);
+        assert!(has_skip(&t, "buy-only"));
+        assert_eq!(t.state.snapshot().positions[0].status, PositionStatus::Held);
     }
 }

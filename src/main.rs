@@ -1,3 +1,5 @@
+use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -69,49 +71,17 @@ async fn main() -> Result<()> {
     let risk = RiskConfig::from_env().context("invalid risk configuration")?;
     let community_config =
         CommunityConfig::from_env().context("invalid community configuration")?;
-    if community_config.require_community {
-        info!(
-            "Buy rule: new coins only, bought after {} slots if >= {} unique buyers and >= {} SOL bid; copy-trade follows tokens up to {} slots old (0 = no limit)",
-            community_config.window_slots,
-            community_config.min_buyers,
-            community_config.min_volume_sol,
-            community_config.max_token_age_slots
-        );
-    } else {
-        info!("Buy rule: new coins only, bought as soon as they are created (community check off)");
-    }
     let copy_config =
         CopyConfig::from_env(config.buy_amount_sol).context("invalid copy-trade configuration")?;
     if copy_config.wallets.contains(&config.payer.pubkey()) {
         anyhow::bail!("COPY_WALLETS contains this bot's own wallet; it would copy itself");
     }
-    if copy_config.enabled() {
-        info!(
-            "Copy-trade: following {} wallet(s), {} SOL per copy, sell with leader: {}, max hold {} slots",
-            copy_config.wallets.len(),
-            copy_config.buy_sol,
-            copy_config.sell_with_leader,
-            copy_config.max_hold_slots
-        );
-    }
-    info!(
-        "Risk: max {} open, spend cap {} SOL, drawdown cap {} SOL, slippage {}%, dev buy {}..{} SOL, {} blocked creators, {} blocked keywords (0 = off)",
-        risk.max_open_positions,
-        risk.max_session_spend_sol,
-        risk.max_session_drawdown_sol,
-        risk.buy_slippage_percent,
-        risk.min_dev_buy_sol,
-        risk.max_dev_buy_sol,
-        risk.blocked_creators.len(),
-        risk.blocked_keywords.len()
-    );
-    info!(
-        "Wallet {} | buy {} SOL | tip {} SOL | sell after {} slots",
-        config.payer.pubkey(),
-        config.buy_amount_sol,
-        config.bribe_fee,
-        config.sell_delay_slots
-    );
+    // Where the dashboard saves the followed wallets ("off" = do not save).
+    let copy_store = match env::var("COPY_STATE_FILE") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("off") => None,
+        Ok(v) if !v.trim().is_empty() => Some(PathBuf::from(v.trim())),
+        _ => Some(PathBuf::from("copy_trade.json")),
+    };
 
     let priority_fee = PriorityFeePump {
         unit_limit: 100_000,
@@ -122,10 +92,23 @@ async fn main() -> Result<()> {
     };
     let sdk = PumpFunSDK::new(&config.rpc_url, &config.astralane_url, priority_fee).await;
 
-    let state = Arc::new(AppState::new(
+    // Where the trading mode is saved ("off" = do not save).
+    let rules_store = match env::var("RULES_STATE_FILE") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("off") => None,
+        Ok(v) if !v.trim().is_empty() => Some(PathBuf::from(v.trim())),
+        _ => Some(PathBuf::from("rules.json")),
+    };
+
+    let state = Arc::new(AppState::configured(
         config.payer.pubkey(),
         Settings::from_config(&config),
+        risk,
+        copy_config,
+        community_config,
+        copy_store,
+        rules_store,
     ));
+    log_configuration(&config, &state);
     let trader = Trader::new(sdk, config.payer.insecure_clone(), state.clone());
 
     if let Some(api_config) = api_config {
@@ -199,6 +182,56 @@ async fn refresh_balance(trader: Trader) {
     }
 }
 
+/// Logs the configuration the bot is actually running with, read back from the state.
+fn log_configuration(config: &Config, state: &AppState) {
+    info!(
+        "Wallet {} | buy {} SOL | tip {} SOL | sell after {} slots | mode {:?}",
+        config.payer.pubkey(),
+        state.settings.buy_amount_sol(),
+        state.settings.bribe_fee_sol(),
+        state.settings.sell_delay_slots(),
+        state.settings.mode()
+    );
+    let view = state.settings.view();
+    if view.cost_pct_of_buy > shred_pool_cache::costs::HIGH_COST_PCT {
+        warn!(
+            "Fees per buy+sell are about {:.5} SOL, {:.0}% of the {} SOL bought: a trade needs to gain more than that just to break even. Raise SOL_BUY_AMOUNT or lower BRIBE_FEE.",
+            view.round_trip_cost_sol, view.cost_pct_of_buy, view.buy_amount_sol
+        );
+    }
+    let c = &state.community.config;
+    if c.require_community {
+        info!(
+            "Buy rule: new coins only, bought after {} slots if >= {} unique buyers and >= {} SOL bid; copy-trade follows tokens up to {} slots old (0 = no limit)",
+            c.window_slots, c.min_buyers, c.min_volume_sol, c.max_token_age_slots
+        );
+    } else {
+        info!("Buy rule: new coins only, bought as soon as they are created (community check off)");
+    }
+    let r = &state.risk;
+    info!(
+        "Risk: max {} open, spend cap {} SOL, drawdown cap {} SOL, slippage {}%, dev buy {}..{} SOL, {} blocked creators, {} blocked keywords (0 = off)",
+        r.max_open_positions,
+        r.max_session_spend_sol,
+        r.max_session_drawdown_sol,
+        r.buy_slippage_percent,
+        r.min_dev_buy_sol,
+        r.max_dev_buy_sol,
+        r.blocked_creators.len(),
+        r.blocked_keywords.len()
+    );
+    let f = &state.follow;
+    info!(
+        "Copy-trade: {} ({} wallet(s) followed, saved to disk: {}), {} SOL per copy, sell with leader: {}, max hold {} slots",
+        if f.active() { "ON" } else { "off" },
+        f.wallets().len(),
+        f.persisted(),
+        state.copy.buy_sol,
+        state.copy.sell_with_leader,
+        state.copy.max_hold_slots
+    );
+}
+
 fn is_create_ix(account_keys: &[Pubkey], ix: &CompiledInstruction) -> bool {
     ix.data.len() >= 8
         && ix.data[0..8] == PUMP_CREATE_DISCRIMINATOR
@@ -230,6 +263,9 @@ async fn run_stream(config: &Config, trader: &Trader) -> Result<()> {
         state.set_slot(curr_slot);
         trader.sell_due(curr_slot);
         community::handle_due(trader, curr_slot);
+        // The dashboard can change who is followed at any time; read it once per message.
+        let followed = state.follow.wallets();
+        let followed_active = state.follow.active();
 
         let entries =
             match bincode::deserialize::<Vec<solana_entry::entry::Entry>>(&slot_entry.entries) {
@@ -252,10 +288,8 @@ async fn run_stream(config: &Config, trader: &Trader) -> Result<()> {
                 }
 
                 // Copy-trade: mirror what the followed wallets do on Pump.fun.
-                if state.copy.enabled() {
-                    if let Some(trade) =
-                        copy::leader_trade(account_keys, instructions, &state.copy.wallets)
-                    {
+                if followed_active {
+                    if let Some(trade) = copy::leader_trade(account_keys, instructions, &followed) {
                         copy::handle_leader_trade(trader, trade, curr_slot, blockhash);
                     }
                 }

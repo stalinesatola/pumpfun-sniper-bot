@@ -22,7 +22,7 @@ use solana_sdk::pubkey::Pubkey;
 use crate::config::optional_parsed;
 use crate::copy::{IX_BUY_CREATOR_VAULT, IX_MINT, IX_USER};
 use crate::risk::{lamports_to_sol, Candidate};
-use crate::state::PositionSource;
+use crate::state::{PositionSource, TradingMode};
 use crate::trader::{BuyRequest, Trader};
 use crate::types::{BuyAmounts, PUMP_FUN_PROGRAM_ID, PUMP_ORDER_BUY};
 
@@ -397,6 +397,9 @@ fn decide(trader: &Trader, due: Due, slot: u64) {
     }
     if state.settings.paused() {
         return skip("bot is paused");
+    }
+    if !state.settings.mode().allows_buys() {
+        return skip(TradingMode::BUY_REFUSED);
     }
     let (Some(reference), Some(creator_vault)) = (due.reference, due.creator_vault) else {
         return skip("no buy seen to price the order from");
@@ -855,5 +858,24 @@ mod tests {
         launch_with_dev_buy(&blocked, 3, 100);
         handle_due(&blocked, 100);
         assert!(skipped(&blocked, "blocked keyword"));
+    }
+
+    #[tokio::test]
+    async fn sell_only_mode_opens_no_new_positions() {
+        let t = trader(CommunityConfig {
+            require_community: false,
+            ..cfg()
+        })
+        .await;
+        t.state.set_mode(TradingMode::SellOnly);
+        launch_with_dev_buy(&t, 1, 100);
+        handle_due(&t, 100);
+        assert!(skipped(&t, "sell-only"));
+        assert!(!buy_attempted_within(&t, key(1), 4).await);
+
+        t.state.set_mode(TradingMode::BuyOnly);
+        launch_with_dev_buy(&t, 2, 100);
+        handle_due(&t, 100);
+        assert!(buy_attempted(&t, key(2)).await, "buy-only still buys");
     }
 }

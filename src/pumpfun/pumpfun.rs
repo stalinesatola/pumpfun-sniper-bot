@@ -1,3 +1,4 @@
+use crate::costs::{COMPUTE_UNIT_LIMIT, CU_PRICE_MICROLAMPORTS};
 use crate::pumpfun::constants::*;
 use crate::pumpfun::error::{PumpFunError, PumpFunResult};
 use crate::pumpfun::instruction_builder;
@@ -146,7 +147,8 @@ impl PumpFunSDK {
         )?;
 
         // Create compute budget instructions
-        let mut compute_unit_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(150_000);
+        let mut compute_unit_limit_ix =
+            ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNIT_LIMIT);
         let jitodontfront = AccountMeta {
             pubkey: Pubkey::from_str("jitodontfront11111111111111111ButMyNiggasDo").unwrap(),
             is_signer: false,
@@ -154,8 +156,9 @@ impl PumpFunSDK {
         };
         compute_unit_limit_ix.accounts.push(jitodontfront);
 
-        let compute_unit_price_ix =
-            ComputeBudgetInstruction::set_compute_unit_price(params.cu_price * 1_000_000); // 25 lamports
+        let compute_unit_price_ix = ComputeBudgetInstruction::set_compute_unit_price(
+            params.cu_price * CU_PRICE_MICROLAMPORTS,
+        ); // 25 lamports
 
         // let tip_acc_str = self.jito_client.get_tip_account().await.unwrap();
         // let jito_fee_ix = system_instruction::transfer(
@@ -240,9 +243,11 @@ impl PumpFunSDK {
         )?;
 
         // Create compute budget instructions
-        let compute_unit_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(150_000);
-        let compute_unit_price_ix =
-            ComputeBudgetInstruction::set_compute_unit_price(params.cu_price * 1_000_000);
+        let compute_unit_limit_ix =
+            ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNIT_LIMIT);
+        let compute_unit_price_ix = ComputeBudgetInstruction::set_compute_unit_price(
+            params.cu_price * CU_PRICE_MICROLAMPORTS,
+        );
 
         let zeroblock_fee =
             system_instruction::transfer(&user, &ZEROBLOCK_FEE, sol_to_lamports(0.0001));
