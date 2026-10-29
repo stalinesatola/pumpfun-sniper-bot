@@ -160,7 +160,8 @@ impl CommunityConfig {
 pub struct LastBuy {
     pub token_amount: u64,
     pub sol_amount: u64,
-    pub blockhash: Hash,
+    /// Known when the buy was read from a transaction; the logs feed does not carry it.
+    pub blockhash: Option<Hash>,
 }
 
 /// A token whose creation was just seen.
@@ -298,7 +299,7 @@ impl CommunityTracker {
 
     /// Counts a buy towards a watched token. Buys of tokens we are not watching, and buys by
     /// the creator's own wallet, never count as community.
-    pub fn observe_buy(&self, buy: &ObservedBuy, blockhash: Hash) {
+    pub fn observe_buy(&self, buy: &ObservedBuy, blockhash: Option<Hash>) {
         let mut inner = lock(&self.inner);
         let Some(t) = inner.tokens.get_mut(&buy.mint) else {
             return;
@@ -387,12 +388,9 @@ impl CommunityTracker {
     }
 }
 
-/// Every Pump.fun buy in a transaction, by anyone, whichever generation of instruction.
-pub fn pump_buys<'a>(
-    account_keys: &'a [Pubkey],
-    instructions: &'a [CompiledInstruction],
-) -> impl Iterator<Item = ObservedBuy> + 'a {
-    parse::ops(account_keys, instructions).filter_map(|op| match op {
+/// The buys among a transaction's Pump.fun operations.
+pub fn buys_from_ops(ops: &[Op]) -> impl Iterator<Item = ObservedBuy> + '_ {
+    ops.iter().filter_map(|op| match op {
         Op::Trade(t) if t.side == Side::Buy => Some(ObservedBuy {
             mint: t.mint,
             buyer: t.user,
@@ -403,6 +401,15 @@ pub fn pump_buys<'a>(
         }),
         _ => None,
     })
+}
+
+/// Every Pump.fun buy in a transaction, by anyone, whichever generation of instruction.
+pub fn pump_buys<'a>(
+    account_keys: &'a [Pubkey],
+    instructions: &'a [CompiledInstruction],
+) -> impl Iterator<Item = ObservedBuy> + 'a {
+    let ops: Vec<Op> = parse::ops(account_keys, instructions).collect();
+    buys_from_ops(&ops).collect::<Vec<_>>().into_iter()
 }
 
 /// Decides every token whose window just ended: buy it if its community is active and the
@@ -465,7 +472,7 @@ fn decide(trader: &Trader, due: Due, slot: u64) {
         creator: due.creator_wallet,
         sol: buy_sol,
         tip_sol,
-        blockhash: due.reference.map(|r| r.blockhash),
+        blockhash: due.reference.and_then(|r| r.blockhash),
         sell_at_slot: slot + state.settings.sell_delay_slots(),
         source: PositionSource::Snipe,
     });
@@ -574,7 +581,7 @@ mod tests {
         let t = CommunityTracker::new(cfg());
         t.track(new_token(1, 100));
         for b in 1..=3 {
-            t.observe_buy(&buy(1, b, SOL), Hash::default());
+            t.observe_buy(&buy(1, b, SOL), None);
         }
         assert!(t.take_due(109).is_empty(), "window not over yet");
         let due = t.take_due(110);
@@ -593,15 +600,15 @@ mod tests {
 
         // Token 1: three buyers but too little SOL.
         for b in 1..=3 {
-            t.observe_buy(&buy(1, b, SOL / 100), Hash::default());
+            t.observe_buy(&buy(1, b, SOL / 100), None);
         }
         // Token 2: lots of SOL from a single wallet buying repeatedly.
         for _ in 0..10 {
-            t.observe_buy(&buy(2, 1, SOL), Hash::default());
+            t.observe_buy(&buy(2, 1, SOL), None);
         }
         // Token 3: three buyers and enough SOL.
         for b in 1..=3 {
-            t.observe_buy(&buy(3, b, SOL), Hash::default());
+            t.observe_buy(&buy(3, b, SOL), None);
         }
 
         let due = t.take_due(10);
@@ -622,9 +629,9 @@ mod tests {
         let t = CommunityTracker::new(cfg());
         t.track(new_token(1, 0));
         // The creator's own wallet buying more is not community.
-        t.observe_buy(&buy(1, 200, 5 * SOL), Hash::default());
+        t.observe_buy(&buy(1, 200, 5 * SOL), None);
         // A token we never saw created is ignored entirely.
-        t.observe_buy(&buy(7, 1, SOL), Hash::default());
+        t.observe_buy(&buy(7, 1, SOL), None);
         let due = t.take_due(10);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].unique_buyers, 0);
@@ -639,16 +646,16 @@ mod tests {
         nt.reference = Some(LastBuy {
             token_amount: 1,
             sol_amount: 2,
-            blockhash: Hash::new_from_array([1; 32]),
+            blockhash: Some(Hash::new_from_array([1; 32])),
         });
         t.track(nt);
         let mut b = buy(1, 1, 3 * SOL);
         b.token_amount = 777;
-        t.observe_buy(&b, Hash::new_from_array([9; 32]));
+        t.observe_buy(&b, Some(Hash::new_from_array([9; 32])));
         let due = t.take_due(10);
         let r = due[0].reference.unwrap();
         assert_eq!((r.token_amount, r.sol_amount), (777, 3 * SOL));
-        assert_eq!(r.blockhash, Hash::new_from_array([9; 32]));
+        assert_eq!(r.blockhash, Some(Hash::new_from_array([9; 32])));
         assert_eq!(due[0].creator_vault, Some(key(99)));
     }
 
@@ -695,7 +702,7 @@ mod tests {
             .unwrap_err()
             .contains("community"));
         for b in 1..=3 {
-            t.observe_buy(&buy(1, b, SOL), Hash::default());
+            t.observe_buy(&buy(1, b, SOL), None);
         }
         assert_eq!(t.check_for_copy(&key(1), 105), Ok(Some(key(200))));
         // Too old, whatever its community.
@@ -799,7 +806,7 @@ mod tests {
             reference: Some(LastBuy {
                 token_amount: 1_000_000,
                 sol_amount: SOL,
-                blockhash: Hash::default(),
+                blockhash: None,
             }),
         });
     }
@@ -811,13 +818,9 @@ mod tests {
         launch_with_dev_buy(&t, 2, 100); // will not
 
         for b in 1..=3 {
-            t.state
-                .community
-                .observe_buy(&buy(1, b, SOL), Hash::default());
+            t.state.community.observe_buy(&buy(1, b, SOL), None);
         }
-        t.state
-            .community
-            .observe_buy(&buy(2, 1, SOL), Hash::default());
+        t.state.community.observe_buy(&buy(2, 1, SOL), None);
 
         handle_due(&t, 105);
         assert!(

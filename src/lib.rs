@@ -4,6 +4,8 @@ pub mod config;
 pub mod copy;
 pub mod costs;
 pub mod feed;
+pub mod feed_ws;
+pub mod ingest;
 pub mod persist;
 pub mod pump;
 pub mod pumpfun;

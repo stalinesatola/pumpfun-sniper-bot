@@ -11,12 +11,15 @@ use log::{error, info, warn};
 use rustls::crypto::aws_lc_rs::default_provider;
 use rustls::crypto::CryptoProvider;
 use shred_pool_cache::api::{self, ApiConfig};
-use shred_pool_cache::community::{self, CommunityConfig, LastBuy, NewToken};
-use shred_pool_cache::config::{optional_parsed, Config};
-use shred_pool_cache::copy::{self, CopyConfig};
+use shred_pool_cache::community::{self, CommunityConfig};
+use shred_pool_cache::config::{optional_parsed, Config, Feed};
+use shred_pool_cache::copy::CopyConfig;
+use shred_pool_cache::ingest::{self, Activity};
+use shred_pool_cache::pump;
+use shred_pool_cache::pump::parse::Op;
 use shred_pool_cache::pumpfun::PumpFunSDK;
 use shred_pool_cache::pumpswap::constants::PriorityFeePump;
-use shred_pool_cache::risk::{lamports_to_sol, RiskConfig};
+use shred_pool_cache::risk::RiskConfig;
 use shred_pool_cache::state::{AppState, Settings};
 use shred_pool_cache::trader::Trader;
 use solana_client::rpc_client::SerializableTransaction;
@@ -83,7 +86,13 @@ async fn main() -> Result<()> {
         sell_tip_fee: 0.001,
         jito_tip_fee: config.bribe_fee,
     };
-    let sdk = PumpFunSDK::new(&config.rpc_url, &config.astralane_url, priority_fee).await;
+    let mut sdk = PumpFunSDK::new(
+        &config.rpc_url,
+        config.astralane_url.as_deref().unwrap_or(&config.rpc_url),
+        priority_fee,
+    )
+    .await;
+    sdk.tips_enabled = config.astralane_url.is_some();
     // The program's global settings are needed by every trade; read them now.
     match sdk.warm_up().await {
         Ok(()) => info!("Read the Pump.fun global settings"),
@@ -132,9 +141,13 @@ async fn main() -> Result<()> {
         let mut delay = MIN_RECONNECT_DELAY;
         loop {
             let started = Instant::now();
-            match run_stream(&config, &trader).await {
-                Ok(()) => warn!("Shredstream closed by the server"),
-                Err(e) => error!("Shredstream error: {e:#}"),
+            let result = match config.feed {
+                Feed::Shredstream => run_stream(&config, &trader).await,
+                Feed::RpcLogs => shred_pool_cache::feed_ws::run(&config.ws_url, &trader).await,
+            };
+            match result {
+                Ok(()) => warn!("The feed was closed by the server"),
+                Err(e) => error!("Feed error: {e:#}"),
             }
             state.set_stream_connected(false);
 
@@ -198,6 +211,18 @@ fn log_configuration(config: &Config, state: &AppState) {
         state.settings.sell_delay_slots(),
         state.settings.mode()
     );
+    info!(
+        "Feed: {} | sender: {}",
+        match config.feed {
+            Feed::Shredstream => "shred stream",
+            Feed::RpcLogs => "RPC logs (WebSocket)",
+        },
+        if config.astralane_url.is_some() {
+            "Astralane (landing tip on)"
+        } else {
+            "plain RPC (no landing tip)"
+        }
+    );
     let view = state.settings.view();
     if view.cost_pct_of_buy > shred_pool_cache::costs::HIGH_COST_PCT {
         warn!(
@@ -243,17 +268,15 @@ fn log_configuration(config: &Config, state: &AppState) {
 #[allow(deprecated)]
 async fn run_stream(config: &Config, trader: &Trader) -> Result<()> {
     let state = &trader.state;
-    info!(
-        "Connecting to ShredstreamProxy at: {}",
-        config.shredstream_url
-    );
+    let url = config
+        .shredstream_url
+        .as_deref()
+        .context("SHREDSTREAM_URL is not set")?;
+    info!("Connecting to ShredstreamProxy at: {url}");
 
-    let mut client = shred_pool_cache::feed::connect(
-        &config.shredstream_url,
-        config.shredstream_token.as_deref(),
-    )
-    .await
-    .context("could not connect to the Shredstream feed")?;
+    let mut client = shred_pool_cache::feed::connect(url, config.shredstream_token.as_deref())
+        .await
+        .context("could not connect to the Shredstream feed")?;
     let mut stream = client
         .subscribe_entries(SubscribeEntriesRequest {})
         .await
@@ -283,77 +306,18 @@ async fn run_stream(config: &Config, trader: &Trader) -> Result<()> {
             for tx in &entry.transactions {
                 let account_keys = tx.message.static_account_keys();
                 let instructions = tx.message.instructions();
-                let blockhash = *tx.message.recent_blockhash();
-
-                // Community: count every buy of the tokens we are watching.
-                for buy in community::pump_buys(account_keys, instructions) {
-                    state.community.observe_buy(&buy, blockhash);
-                }
-
-                // Copy-trade: mirror what the followed wallets do on Pump.fun.
-                if followed_active {
-                    if let Some(trade) = copy::leader_trade(account_keys, instructions, &followed) {
-                        copy::handle_leader_trade(trader, trade, curr_slot, blockhash);
-                    }
-                }
-
-                let Some(create) = shred_pool_cache::pump::parse::ops(account_keys, instructions)
-                    .find_map(|op| match op {
-                        shred_pool_cache::pump::parse::Op::Create(c) => Some(c),
-                        _ => None,
-                    })
-                else {
+                let ops: Vec<Op> = pump::parse::ops(account_keys, instructions).collect();
+                if ops.is_empty() {
                     continue;
-                };
-
+                }
                 let signature = tx.get_signature().to_string();
-                info!(
-                    "Found PumpFun {} TX: {} ({})",
-                    if create.v2 { "create_v2" } else { "create" },
-                    signature,
-                    create.symbol
-                );
-
-                // The fee payer is the wallet that launched the token.
-                let creator_wallet = create.user;
-                state.record_create(&create.mint, &creator_wallet, &signature, curr_slot);
-
-                // The creator's own launch buy, if any, is the first price we have.
-                let launch_buy = shred_pool_cache::pump::parse::ops(account_keys, instructions)
-                    .find_map(|op| match op {
-                        shred_pool_cache::pump::parse::Op::Trade(t)
-                            if t.side == shred_pool_cache::pump::parse::Side::Buy
-                                && t.mint == create.mint
-                                && t.token_amount > 0 =>
-                        {
-                            Some(t)
-                        }
-                        _ => None,
-                    });
-                let lamports_if_sol = |t: &shred_pool_cache::pump::parse::Trade| {
-                    if t.quote == shred_pool_cache::pump::parse::Quote::Sol {
-                        lamports_to_sol(t.quote_amount)
-                    } else {
-                        0.0
-                    }
-                };
-                state.community.track(NewToken {
-                    mint: create.mint,
-                    quote: create.quote,
-                    creator_wallet,
-                    creator_vault: launch_buy.and_then(|t| t.creator_vault),
-                    name: Some(create.name.clone()),
-                    symbol: Some(create.symbol.clone()),
-                    dev_buy_sol: launch_buy.as_ref().map_or(0.0, lamports_if_sol),
+                let activity = Activity {
                     slot: curr_slot,
-                    reference: launch_buy.map(|t| LastBuy {
-                        token_amount: t.token_amount,
-                        sol_amount: t.quote_amount,
-                        blockhash,
-                    }),
-                });
-                // With the community rule off the decision is due right now.
-                community::handle_due(trader, curr_slot);
+                    signature: &signature,
+                    blockhash: Some(*tx.message.recent_blockhash()),
+                    ops: &ops,
+                };
+                ingest::process(trader, &activity, &followed, followed_active);
             }
         }
     }
