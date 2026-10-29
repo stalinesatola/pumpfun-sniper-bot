@@ -4,6 +4,9 @@
 //! Everything here comes from the official IDL (github.com/pump-fun/pump-public-docs). New
 //! tokens are created with `create_v2` (Token-2022) and can be paired with SOL or USDC, and
 //! trades come in several generations of instructions; the parser understands all of them.
+pub mod accounts;
+pub mod ix;
+pub mod market;
 pub mod parse;
 
 use solana_sdk::pubkey;

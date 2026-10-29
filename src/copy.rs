@@ -19,7 +19,6 @@ use crate::pump::parse::{self, Op, Quote};
 use crate::risk::{lamports_to_sol, Candidate};
 use crate::state::{PositionSource, TradingMode, MAX_BUY_AMOUNT_SOL};
 use crate::trader::{BuyRequest, Trader};
-use crate::types::BuyAmounts;
 
 const MAX_HOLD_SLOTS_LIMIT: u64 = 2_000;
 
@@ -437,9 +436,6 @@ fn copy_buy(trader: &Trader, trade: LeaderTrade, slot: u64, blockhash: Hash) {
     if trade.quote != Quote::Sol {
         return skip("token is paired with USDC; copying it is not supported yet".into());
     }
-    let Some(creator_vault) = trade.creator_vault else {
-        return skip("leader's instruction does not carry the creator vault".into());
-    };
     if trade.token_amount == 0 || trade.sol_amount == 0 {
         return skip("leader instruction has a zero amount".into());
     }
@@ -458,8 +454,8 @@ fn copy_buy(trader: &Trader, trade: LeaderTrade, slot: u64, blockhash: Hash) {
     let buy_sol = state.copy.buy_sol;
     let tip_sol = state.settings.bribe_fee_sol();
     let candidate = Candidate {
-        // The creator's wallet when we saw the launch; the vault address is all we have otherwise.
-        creator: creator_wallet.as_ref().unwrap_or(&creator_vault),
+        // The creator's wallet (we saw the launch); the mint stands in when it is unknown.
+        creator: creator_wallet.as_ref().unwrap_or(&trade.mint),
         name: None,
         symbol: None,
         dev_buy_sol: trade.sol(),
@@ -478,14 +474,10 @@ fn copy_buy(trader: &Trader, trade: LeaderTrade, slot: u64, blockhash: Hash) {
 
     trader.spawn_buy(BuyRequest {
         mint: trade.mint,
-        creator_vault,
+        creator: creator_wallet.unwrap_or(trade.mint),
         sol: buy_sol,
         tip_sol,
-        reference: BuyAmounts {
-            base_amount_out: trade.token_amount,
-            max_quote_amount_in: trade.sol_amount,
-        },
-        blockhash,
+        blockhash: Some(blockhash),
         sell_at_slot: slot + state.copy.max_hold_slots,
         source: PositionSource::Copy {
             leader: trade.leader.to_string(),

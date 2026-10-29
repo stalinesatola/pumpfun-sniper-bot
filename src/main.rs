@@ -86,6 +86,13 @@ async fn main() -> Result<()> {
         jito_tip_fee: config.bribe_fee,
     };
     let sdk = PumpFunSDK::new(&config.rpc_url, &config.astralane_url, priority_fee).await;
+    // The program's global settings are needed by every trade; read them now.
+    match sdk.warm_up().await {
+        Ok(()) => info!("Read the Pump.fun global settings"),
+        Err(e) => warn!(
+            "Could not read the Pump.fun global settings yet ({e}); will retry on the first trade"
+        ),
+    }
 
     // Where the trading mode is saved ("off" = do not save).
     let rules_store = match env::var("RULES_STATE_FILE") {

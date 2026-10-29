@@ -24,7 +24,6 @@ use crate::pump::parse::{self, Op, Quote, Side};
 use crate::risk::{lamports_to_sol, Candidate};
 use crate::state::{PositionSource, TradingMode};
 use crate::trader::{BuyRequest, Trader};
-use crate::types::BuyAmounts;
 
 /// Unique buyers remembered per token; thresholds above this are rejected at startup.
 const MAX_BUYERS_TRACKED: usize = 128;
@@ -434,9 +433,6 @@ fn decide(trader: &Trader, due: Due, slot: u64) {
     if due.quote != Quote::Sol {
         return skip("token is paired with USDC; buying it is not supported yet");
     }
-    let (Some(reference), Some(creator_vault)) = (due.reference, due.creator_vault) else {
-        return skip("no buy seen to price the order from");
-    };
 
     // Settings can change from the dashboard at any time; read them per buy.
     let buy_sol = state.settings.buy_amount_sol();
@@ -466,14 +462,10 @@ fn decide(trader: &Trader, due: Due, slot: u64) {
     );
     trader.spawn_buy(BuyRequest {
         mint: due.mint,
-        creator_vault,
+        creator: due.creator_wallet,
         sol: buy_sol,
         tip_sol,
-        reference: BuyAmounts {
-            base_amount_out: reference.token_amount,
-            max_quote_amount_in: reference.sol_amount,
-        },
-        blockhash: reference.blockhash,
+        blockhash: due.reference.map(|r| r.blockhash),
         sell_at_slot: slot + state.settings.sell_delay_slots(),
         source: PositionSource::Snipe,
     });
@@ -871,10 +863,10 @@ mod tests {
         assert!(skipped(&t, "paused"));
         t.state.set_paused(false);
 
-        // A launch without a creator buy has nothing to price the order from.
+        // Tokens paired with USDC are tracked but not bought yet.
         t.state.community.track(NewToken {
             mint: key(2),
-            quote: Quote::Sol,
+            quote: Quote::Usdc,
             creator_wallet: key(200),
             creator_vault: None,
             name: None,
@@ -884,7 +876,7 @@ mod tests {
             reference: None,
         });
         handle_due(&t, 100);
-        assert!(skipped(&t, "no buy seen"));
+        assert!(skipped(&t, "paired with USDC"));
 
         // The blocked-keyword list still applies, using the token name read from the launch.
         let mut blocked = trader(CommunityConfig {
