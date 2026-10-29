@@ -377,7 +377,13 @@ pub fn leader_trade(
     if !account_keys.iter().any(|k| followed.contains(k)) {
         return None;
     }
-    parse::ops(account_keys, instructions).find_map(|op| match op {
+    let ops: Vec<Op> = parse::ops(account_keys, instructions).collect();
+    leader_trade_from_ops(&ops, followed)
+}
+
+/// The first trade by a followed wallet among a transaction's Pump.fun operations.
+pub fn leader_trade_from_ops(ops: &[Op], followed: &HashSet<Pubkey>) -> Option<LeaderTrade> {
+    ops.iter().find_map(|op| match op {
         Op::Trade(t) if followed.contains(&t.user) => Some(LeaderTrade {
             side: t.side,
             leader: t.user,
@@ -393,7 +399,12 @@ pub fn leader_trade(
 
 /// Reacts to a followed wallet's trade. Buys are sent from their own task so a slow RPC
 /// never stalls the shredstream loop.
-pub fn handle_leader_trade(trader: &Trader, trade: LeaderTrade, slot: u64, blockhash: Hash) {
+pub fn handle_leader_trade(
+    trader: &Trader,
+    trade: LeaderTrade,
+    slot: u64,
+    blockhash: Option<Hash>,
+) {
     let state = &trader.state;
     let copy = &state.copy;
     state.record_copy_signal(&trade, slot);
@@ -417,7 +428,7 @@ pub fn handle_leader_trade(trader: &Trader, trade: LeaderTrade, slot: u64, block
     }
 }
 
-fn copy_buy(trader: &Trader, trade: LeaderTrade, slot: u64, blockhash: Hash) {
+fn copy_buy(trader: &Trader, trade: LeaderTrade, slot: u64, blockhash: Option<Hash>) {
     let state = &trader.state;
     let skip = |reason: String| {
         info!(
@@ -477,7 +488,7 @@ fn copy_buy(trader: &Trader, trade: LeaderTrade, slot: u64, blockhash: Hash) {
         creator: creator_wallet.unwrap_or(trade.mint),
         sol: buy_sol,
         tip_sol,
-        blockhash: Some(blockhash),
+        blockhash,
         sell_at_slot: slot + state.copy.max_hold_slots,
         source: PositionSource::Copy {
             leader: trade.leader.to_string(),
@@ -720,7 +731,7 @@ mod tests {
             ..cfg()
         })
         .await;
-        let bh = Hash::default();
+        let bh = Some(Hash::default());
 
         t.state.set_paused(true);
         handle_leader_trade(&t, trade(Side::Buy, key(50), 1_000_000_000), 100, bh);
@@ -761,7 +772,7 @@ mod tests {
             &t,
             trade(Side::Buy, key(61), 1_000_000_000),
             100,
-            Hash::default(),
+            Some(Hash::default()),
         );
         assert!(has_skip(&t, "positions already open"));
         assert!(
@@ -782,7 +793,7 @@ mod tests {
                 &t,
                 trade(Side::Buy, key(100 + n), 1_000_000_000),
                 100,
-                Hash::default(),
+                Some(Hash::default()),
             );
         }
         let skipped = t
@@ -803,7 +814,7 @@ mod tests {
             &t,
             trade(Side::Buy, mint, 1_000_000_000),
             100,
-            Hash::default(),
+            Some(Hash::default()),
         );
 
         // The RPC is unreachable, so the spawned buy fails; wait for that to be reported.
@@ -831,7 +842,7 @@ mod tests {
     #[tokio::test]
     async fn leader_sell_only_closes_copied_positions() {
         let t = trader(cfg()).await;
-        let bh = Hash::default();
+        let bh = Some(Hash::default());
 
         let copied = key(80);
         t.state.record_buy_sent_from(
@@ -940,14 +951,14 @@ mod tests {
                 token_amount: 1_000,
                 sol_amount: 1_000_000,
             },
-            Hash::default(),
+            Some(Hash::default()),
         );
     }
 
     #[tokio::test]
     async fn copying_needs_a_new_token_with_an_active_community() {
         let t = gated_trader().await;
-        let bh = Hash::default();
+        let bh = Some(Hash::default());
 
         // A token whose launch we never saw is not "new".
         handle_leader_trade(&t, trade(Side::Buy, key(120), 1_000_000_000), 100, bh);
@@ -980,7 +991,7 @@ mod tests {
             &t,
             trade(Side::Buy, mint, 1_000_000_000),
             105,
-            Hash::default(),
+            Some(Hash::default()),
         );
         // Not skipped: a buy was attempted (and fails, since no RPC is reachable).
         let mut attempted = false;
@@ -1144,7 +1155,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_trading_mode_gates_copy_buys_and_leader_sells() {
-        let bh = Hash::default();
+        let bh = Some(Hash::default());
 
         // Sell-only: a leader buy is not copied.
         let t = trader(cfg()).await;

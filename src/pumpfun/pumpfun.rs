@@ -65,11 +65,13 @@ pub fn buy_instructions(
     let mut instructions = compute_budget();
     instructions.extend(market.prepare_buy(user));
     instructions.push(market.buy_exact_quote_in(user, spend, min_tokens));
-    instructions.push(system_instruction::transfer(
-        user,
-        &ASTRALANE_TIP,
-        tip_lamports,
-    ));
+    if tip_lamports > 0 {
+        instructions.push(system_instruction::transfer(
+            user,
+            &ASTRALANE_TIP,
+            tip_lamports,
+        ));
+    }
     instructions
 }
 
@@ -83,11 +85,13 @@ pub fn sell_instructions(
     close_account: bool,
 ) -> Vec<Instruction> {
     let mut instructions = compute_budget();
-    instructions.push(system_instruction::transfer(
-        user,
-        &ASTRALANE_TIP,
-        tip_lamports,
-    ));
+    if tip_lamports > 0 {
+        instructions.push(system_instruction::transfer(
+            user,
+            &ASTRALANE_TIP,
+            tip_lamports,
+        ));
+    }
     instructions.push(market.sell(user, amount, 0));
     if close_account {
         instructions.push(market.close_token_account(user));
@@ -132,6 +136,8 @@ pub struct PumpFunSDK {
     pub client: Arc<RpcClient>,
     pub astralane_client: Arc<RpcClient>,
     pub priority_fee: PriorityFeePump,
+    /// Pay the landing tip to the sender. Off when transactions go through a plain RPC.
+    pub tips_enabled: bool,
     globals: Arc<GlobalCache>,
 }
 
@@ -145,7 +151,16 @@ impl PumpFunSDK {
             client: Arc::new(RpcClient::new(String::from(rpc_url))),
             astralane_client: Arc::new(RpcClient::new(astralane_url.to_string())),
             priority_fee,
+            tips_enabled: true,
             globals: Arc::new(GlobalCache::default()),
+        }
+    }
+
+    fn tip_lamports(&self) -> u64 {
+        if self.tips_enabled {
+            sol_to_lamports(self.priority_fee.jito_tip_fee)
+        } else {
+            0
         }
     }
 
@@ -221,7 +236,7 @@ impl PumpFunSDK {
             &user_keypair,
             blockhash,
             token_amount,
-            sol_to_lamports(self.priority_fee.jito_tip_fee),
+            self.tip_lamports(),
             true,
         )?;
         self.place_tx(tx).await
@@ -267,7 +282,7 @@ impl PumpFunSDK {
             blockhash,
             spend,
             min_tokens_out(expected, slippage_percent),
-            sol_to_lamports(self.priority_fee.jito_tip_fee),
+            self.tip_lamports(),
         )?;
         Ok((self.place_tx(tx).await?, expected))
     }
@@ -276,6 +291,42 @@ impl PumpFunSDK {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_market() -> Market {
+        use crate::pump::accounts::BondingCurve;
+        use crate::pump::{TOKEN_2022_PROGRAM, WSOL_MINT};
+        Market {
+            mint: Pubkey::new_unique(),
+            curve: BondingCurve {
+                virtual_token_reserves: 1,
+                virtual_quote_reserves: 1,
+                real_token_reserves: 1,
+                real_quote_reserves: 1,
+                token_total_supply: 1,
+                complete: false,
+                creator: Pubkey::new_unique(),
+                quote: Quote::Sol,
+                quote_mint: WSOL_MINT,
+            },
+            base_token_program: TOKEN_2022_PROGRAM,
+            quote_token_program: ix::TOKEN_PROGRAM,
+            buyback_recipient: Pubkey::new_unique(),
+        }
+    }
+
+    #[test]
+    fn no_tip_means_no_tip_transfer() {
+        let (m, user) = (test_market(), Pubkey::new_unique());
+        let transfers = |ixs: &[Instruction]| {
+            ixs.iter()
+                .filter(|i| i.program_id == solana_system_interface::program::ID)
+                .count()
+        };
+        assert_eq!(transfers(&buy_instructions(&m, &user, 10, 1, 0)), 0);
+        assert_eq!(transfers(&buy_instructions(&m, &user, 10, 1, 5)), 1);
+        assert_eq!(transfers(&sell_instructions(&m, &user, 10, 0, true)), 0);
+        assert_eq!(transfers(&sell_instructions(&m, &user, 10, 5, true)), 1);
+    }
 
     #[test]
     fn slippage_lowers_the_minimum_tokens() {
