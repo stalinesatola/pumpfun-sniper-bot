@@ -47,6 +47,7 @@ dotenvy = "0.15"
 lazy_static = "1.4"
 
 jito-protos = { path = "./jito_protos" }
+tonic = { version = "0.12.3", features = ["tls", "tls-roots", "tls-webpki-roots"] }
 
 bincode = "1.3.3"
 rand = "0.9.1"

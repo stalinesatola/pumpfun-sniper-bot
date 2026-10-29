@@ -6,9 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use dotenvy::dotenv;
 use env_logger::Env;
-use jito_protos::shredstream::{
-    shredstream_proxy_client::ShredstreamProxyClient, SubscribeEntriesRequest,
-};
+use jito_protos::shredstream::SubscribeEntriesRequest;
 use log::{error, info, warn};
 use rustls::crypto::aws_lc_rs::default_provider;
 use rustls::crypto::CryptoProvider;
@@ -250,9 +248,12 @@ async fn run_stream(config: &Config, trader: &Trader) -> Result<()> {
         config.shredstream_url
     );
 
-    let mut client = ShredstreamProxyClient::connect(config.shredstream_url.clone())
-        .await
-        .context("could not connect to the Shredstream proxy")?;
+    let mut client = shred_pool_cache::feed::connect(
+        &config.shredstream_url,
+        config.shredstream_token.as_deref(),
+    )
+    .await
+    .context("could not connect to the Shredstream feed")?;
     let mut stream = client
         .subscribe_entries(SubscribeEntriesRequest {})
         .await
