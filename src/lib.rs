@@ -1,4 +1,5 @@
 pub mod api;
+pub mod community;
 pub mod config;
 pub mod copy;
 pub mod pumpfun;

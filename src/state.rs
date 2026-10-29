@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use tokio::sync::broadcast;
 
+use crate::community::{CommunityConfig, CommunityTracker, CommunityView};
 use crate::config::{positive_sol, Config};
 use crate::copy::{CopyConfig, CopyView, LeaderTrade, Side};
 use crate::risk::{lamports_to_sol, Exposure, RiskConfig, RiskView};
@@ -260,6 +261,7 @@ pub struct Snapshot {
     pub settings: SettingsView,
     pub risk: RiskView,
     pub copy: CopyView,
+    pub community: CommunityView,
     pub session_spent_sol: f64,
     pub drawdown_sol: Option<f64>,
     pub positions: Vec<Position>,
@@ -273,6 +275,7 @@ pub struct AppState {
     pub settings: Settings,
     pub risk: RiskConfig,
     pub copy: CopyConfig,
+    pub community: CommunityTracker,
     /// Mints a buy is currently being sent for, so two signals cannot both buy one token.
     /// SOL reserved per mint for buys being sent, counted by [`Self::exposure`].
     inflight: Mutex<HashMap<Pubkey, f64>>,
@@ -297,6 +300,7 @@ impl AppState {
             settings,
             risk: RiskConfig::default(),
             copy: CopyConfig::default(),
+            community: CommunityTracker::new(CommunityConfig::default()),
             inflight: Mutex::new(HashMap::new()),
             wallet: wallet.to_string(),
             started: Instant::now(),
@@ -315,6 +319,11 @@ impl AppState {
 
     pub fn with_risk(mut self, risk: RiskConfig) -> Self {
         self.risk = risk;
+        self
+    }
+
+    pub fn with_community(mut self, config: CommunityConfig) -> Self {
+        self.community = CommunityTracker::new(config);
         self
     }
 
@@ -633,6 +642,7 @@ impl AppState {
             settings: self.settings.view(),
             risk: self.risk.view(),
             copy: self.copy.view(),
+            community: self.community.view(),
             session_spent_sol: self.session_spent_sol(),
             drawdown_sol: match (self.start_balance_lamports(), self.balance_lamports()) {
                 (Some(start), Some(now)) => Some(lamports_to_sol(start) - lamports_to_sol(now)),

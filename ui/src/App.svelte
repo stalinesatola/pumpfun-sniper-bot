@@ -164,6 +164,20 @@
         {/each}
       </dl>
       <h2 class="mb-2 mt-4 font-medium text-dim">
+        Buy rule: new coins only{snap.community.require_community ? ', with an active community' : ' (community check off)'}
+      </h2>
+      <dl class="num grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3 lg:grid-cols-5">
+        {#each [
+          ['watching now', snap.community.watching],
+          ['decide after', snap.community.require_community ? `${snap.community.window_slots} slots` : 'at creation'],
+          ['unique buyers', snap.community.require_community ? `>= ${snap.community.min_buyers}` : '-'],
+          ['SOL bid', snap.community.require_community ? `>= ${snap.community.min_volume_sol}` : '-'],
+          ['copy: max token age', snap.community.max_token_age_slots ? `${snap.community.max_token_age_slots} slots` : 'no limit'],
+        ] as [label, value]}
+          <div><dt class="font-sans text-dim">{label}</dt><dd>{value}</dd></div>
+        {/each}
+      </dl>
+      <h2 class="mb-2 mt-4 font-medium text-dim">
         Copy-trade {snap.copy.enabled ? '' : '(off: set COPY_WALLETS in .env)'}
       </h2>
       {#if snap.copy.enabled}

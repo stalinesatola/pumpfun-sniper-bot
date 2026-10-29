@@ -3,7 +3,7 @@ use std::env;
 use std::str::FromStr;
 
 use anyhow::{bail, Result};
-use log::{error, info};
+use log::info;
 use serde::Serialize;
 use solana_sdk::hash::Hash;
 use solana_sdk::message::compiled_instruction::CompiledInstruction;
@@ -12,7 +12,7 @@ use solana_sdk::pubkey::Pubkey;
 use crate::config::{optional_parsed, positive_sol};
 use crate::risk::{lamports_to_sol, Candidate};
 use crate::state::{PositionSource, MAX_BUY_AMOUNT_SOL};
-use crate::trader::Trader;
+use crate::trader::{BuyRequest, Trader};
 use crate::types::{BuyAmounts, PUMP_FUN_PROGRAM_ID, PUMP_ORDER_BUY, PUMP_ORDER_SELL};
 
 const MAX_HOLD_SLOTS_LIMIT: u64 = 2_000;
@@ -167,9 +167,9 @@ impl LeaderTrade {
 }
 
 // Account positions in the Pump.fun `buy` / `sell` instructions.
-const IX_MINT: usize = 2;
-const IX_USER: usize = 6;
-const IX_BUY_CREATOR_VAULT: usize = 9;
+pub(crate) const IX_MINT: usize = 2;
+pub(crate) const IX_USER: usize = 6;
+pub(crate) const IX_BUY_CREATOR_VAULT: usize = 9;
 const IX_SELL_CREATOR_VAULT: usize = 8;
 
 /// Looks for a Pump.fun buy or sell signed by a followed wallet. Never panics on
@@ -275,69 +275,47 @@ fn copy_buy(trader: &Trader, trade: LeaderTrade, slot: u64, blockhash: Hash) {
     if state.mint_busy(&trade.mint) {
         return skip("already holding or buying this token".into());
     }
+    // Only new coins, and (if required) ones that already have an active community.
+    let creator_wallet = match state.community.check_for_copy(&trade.mint, slot) {
+        Ok(wallet) => wallet,
+        Err(reason) => return skip(reason),
+    };
 
+    let buy_sol = state.copy.buy_sol;
     let tip_sol = state.settings.bribe_fee_sol();
     let candidate = Candidate {
-        creator: &trade.creator_vault,
+        // The creator's wallet when we saw the launch; the vault address is all we have otherwise.
+        creator: creator_wallet.as_ref().unwrap_or(&trade.creator_vault),
         name: None,
         symbol: None,
         dev_buy_sol: trade.sol(),
     };
-    if let Err(reason) =
-        state
-            .risk
-            .check(&candidate, &state.exposure(), state.copy.buy_sol, tip_sol)
+    if let Err(reason) = state
+        .risk
+        .check(&candidate, &state.exposure(), buy_sol, tip_sol)
     {
         return skip(reason);
     }
     // Reserve the mint and the SOL now, before the buy is sent from its own task, so the
     // next signal in this slot already sees this one in the risk limits.
-    if !state.claim_mint(&trade.mint, state.copy.buy_sol) {
+    if !state.claim_mint(&trade.mint, buy_sol) {
         return skip("already holding or buying this token".into());
     }
 
-    let trader = trader.clone();
-    tokio::spawn(async move {
-        let state = trader.state.clone();
-        let buy_sol = state.copy.buy_sol;
-        let mut sdk = trader.sdk.clone();
-        sdk.priority_fee.jito_tip_fee = tip_sol;
-
-        let result = sdk
-            .buy(
-                &trade.mint,
-                buy_sol,
-                trader.payer.insecure_clone(),
-                blockhash,
-                BuyAmounts {
-                    base_amount_out: trade.token_amount,
-                    max_quote_amount_in: trade.sol_amount,
-                },
-                trade.creator_vault,
-                state.risk.buy_slippage_percent,
-            )
-            .await;
-
-        match result {
-            Ok((signature, _)) => {
-                info!("Copied {} from {}: {}", trade.mint, trade.leader, signature);
-                state.record_buy_sent_from(
-                    &trade.mint,
-                    &trade.creator_vault,
-                    &signature,
-                    buy_sol,
-                    slot + state.copy.max_hold_slots,
-                    PositionSource::Copy {
-                        leader: trade.leader.to_string(),
-                    },
-                );
-            }
-            Err(e) => {
-                error!("Copy buy of {} failed: {}", trade.mint, e);
-                state.record_buy_failed(&trade.mint, &e.to_string());
-            }
-        }
-        state.release_mint(&trade.mint);
+    trader.spawn_buy(BuyRequest {
+        mint: trade.mint,
+        creator_vault: trade.creator_vault,
+        sol: buy_sol,
+        tip_sol,
+        reference: BuyAmounts {
+            base_amount_out: trade.token_amount,
+            max_quote_amount_in: trade.sol_amount,
+        },
+        blockhash,
+        sell_at_slot: slot + state.copy.max_hold_slots,
+        source: PositionSource::Copy {
+            leader: trade.leader.to_string(),
+        },
     });
 }
 
@@ -508,6 +486,7 @@ mod tests {
 
     // ---- handle_leader_trade, against a state with no reachable RPC ----
 
+    use crate::community::{CommunityConfig, NewToken, ObservedBuy};
     use crate::pumpfun::PumpFunSDK;
     use crate::pumpswap::constants::PriorityFeePump;
     use crate::state::{AppState, Event, PositionStatus, Settings};
@@ -516,10 +495,22 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    /// Community and age rules off, so these tests are about the copy logic itself.
+    fn open_gate() -> CommunityConfig {
+        CommunityConfig {
+            require_community: false,
+            max_token_age_slots: 0,
+            ..CommunityConfig::default()
+        }
+    }
+
     async fn trader(copy: CopyConfig) -> Trader {
         let payer = Keypair::new();
-        let state =
-            Arc::new(AppState::new(payer.pubkey(), Settings::new(0.001, 0.001, 7)).with_copy(copy));
+        let state = Arc::new(
+            AppState::new(payer.pubkey(), Settings::new(0.001, 0.001, 7))
+                .with_copy(copy)
+                .with_community(open_gate()),
+        );
         let sdk = PumpFunSDK::new(
             "http://127.0.0.1:1",
             "http://127.0.0.1:1",
@@ -731,5 +722,107 @@ mod tests {
             t2.state.snapshot().positions[0].status,
             PositionStatus::Held
         );
+    }
+
+    // ---- the "new coins with an active community" gate ----
+
+    async fn gated_trader() -> Trader {
+        let payer = Keypair::new();
+        let state = Arc::new(
+            AppState::new(payer.pubkey(), Settings::new(0.001, 0.001, 7))
+                .with_copy(cfg())
+                .with_community(CommunityConfig {
+                    require_community: true,
+                    window_slots: 10,
+                    min_buyers: 2,
+                    min_volume_sol: 0.0,
+                    max_token_age_slots: 100,
+                }),
+        );
+        let sdk = PumpFunSDK::new(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            PriorityFeePump::default(),
+        )
+        .await;
+        Trader::new(sdk, payer, state)
+    }
+
+    fn launch(t: &Trader, mint: Pubkey, slot: u64) {
+        t.state.community.track(NewToken {
+            mint,
+            creator_wallet: key(200),
+            creator_vault: None,
+            name: None,
+            symbol: None,
+            dev_buy_sol: 0.0,
+            slot,
+            reference: None,
+        });
+    }
+
+    fn community_buy(t: &Trader, mint: Pubkey, buyer: u8) {
+        t.state.community.observe_buy(
+            &ObservedBuy {
+                mint,
+                buyer: key(buyer),
+                creator_vault: key(10),
+                token_amount: 1_000,
+                sol_amount: 1_000_000,
+            },
+            Hash::default(),
+        );
+    }
+
+    #[tokio::test]
+    async fn copying_needs_a_new_token_with_an_active_community() {
+        let t = gated_trader().await;
+        let bh = Hash::default();
+
+        // A token whose launch we never saw is not "new".
+        handle_leader_trade(&t, trade(Side::Buy, key(120), 1_000_000_000), 100, bh);
+        assert!(has_skip(&t, "not a new token"));
+
+        // New, but nobody has bought yet.
+        let fresh = key(121);
+        launch(&t, fresh, 100);
+        handle_leader_trade(&t, trade(Side::Buy, fresh, 1_000_000_000), 102, bh);
+        assert!(has_skip(&t, "unique buyers"));
+
+        // Too old.
+        let old = key(122);
+        launch(&t, old, 100);
+        community_buy(&t, old, 1);
+        community_buy(&t, old, 2);
+        handle_leader_trade(&t, trade(Side::Buy, old, 1_000_000_000), 500, bh);
+        assert!(has_skip(&t, "slots old"));
+    }
+
+    #[tokio::test]
+    async fn an_active_new_token_is_copied() {
+        let t = gated_trader().await;
+        let mint = key(130);
+        launch(&t, mint, 100);
+        community_buy(&t, mint, 1);
+        community_buy(&t, mint, 2);
+
+        handle_leader_trade(
+            &t,
+            trade(Side::Buy, mint, 1_000_000_000),
+            105,
+            Hash::default(),
+        );
+        // Not skipped: a buy was attempted (and fails, since no RPC is reachable).
+        let mut attempted = false;
+        for _ in 0..100 {
+            attempted = t.state.snapshot().recent.iter().any(
+                |e| matches!(&e.event, Event::BuyFailed { mint: m, .. } if *m == mint.to_string()),
+            );
+            if attempted {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(attempted, "the copy buy was never attempted");
     }
 }
