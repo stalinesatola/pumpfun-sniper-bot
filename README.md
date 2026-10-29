@@ -241,6 +241,8 @@ Known limits: tokens paired with USDC are only tracked (not bought); tokens that
 
 ## Dashboard (web and terminal)
 
+Start the bot from the project folder, after building the UI once (`cd ui && npm install && npm run build`). If the build is missing, the page at `http://127.0.0.1:8787` tells you how to build it (no restart needed), and the bot also looks for `ui/dist` next to where it was built.
+
 Two front ends share one live state, so they always agree: a **web panel** and a **terminal UI**. The trading loop only publishes events; it never waits for either, so a slow browser cannot delay a buy.
 
 **Web panel**
