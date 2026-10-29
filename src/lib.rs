@@ -3,6 +3,7 @@ pub mod community;
 pub mod config;
 pub mod copy;
 pub mod costs;
+pub mod feed;
 pub mod persist;
 pub mod pump;
 pub mod pumpfun;

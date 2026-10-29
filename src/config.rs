@@ -9,6 +9,8 @@ pub struct Config {
     pub rpc_url: String,
     pub astralane_url: String,
     pub shredstream_url: String,
+    /// Sent as the `x-token` header to hosted shred feeds that need it (`SHREDSTREAM_TOKEN`).
+    pub shredstream_token: Option<String>,
     pub payer: Keypair,
     pub buy_amount_sol: f64,
     pub bribe_fee: f64,
@@ -71,6 +73,10 @@ impl Config {
             rpc_url: required("RPC_URL")?,
             astralane_url: required("ASTRALANE_URL")?,
             shredstream_url: required("SHREDSTREAM_URL")?,
+            shredstream_token: env::var("SHREDSTREAM_TOKEN")
+                .ok()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty()),
             payer,
             buy_amount_sol,
             bribe_fee,

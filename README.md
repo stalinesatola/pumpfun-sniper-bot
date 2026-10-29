@@ -203,13 +203,23 @@ cargo run --release
 
 Use `--release`. Debug builds are too slow for slot-race sniping.
 
+### Where to get the shred feed (`SHREDSTREAM_URL`)
+
+The bot reads new transactions from a gRPC shred feed with the Jito `shredstream.ShredstreamProxy/SubscribeEntries` interface (protos in [jito-labs/mev-protos](https://github.com/jito-labs/mev-protos)). **Jito announced that its own ShredStream shuts down on 5 September 2026**; that comes from several provider blogs and I could not confirm it on Jito's site, so check it first. Providers that say they offer a compatible feed (verify the details and prices with each one, they sell it):
+
+- **RPC Fast**: hosted endpoint `sol-shredstream-<your account>.rpcfast.net:443` with the token in the `x-token` header. Documented in their [Jito ShredStream gRPC page](https://docs.rpcfast.com/solana/jito-shredstream-grpc). Use `SHREDSTREAM_URL=https://sol-shredstream-<account>.rpcfast.net:443` and `SHREDSTREAM_TOKEN=<token>`.
+- **AllenHark**: a fork of the shredstream proxy that you run yourself against their gateway (about $50/month, 24 h trial, access by your keypair's public key, see their [guide](https://allenhark.com/docs/infrastructure/jito-shreds)); the proxy then serves gRPC locally, so use `SHREDSTREAM_URL=http://127.0.0.1:<grpc port>`.
+- Others (OrbitFlare, Chainstack, DoubleZero Edge) exist; Edge delivers raw UDP shreds, not this gRPC interface, so it would need a proxy in between.
+
+`http://` and `https://` URLs are both supported; `SHREDSTREAM_TOKEN` is optional. The connection itself has not been tested against a live provider by these changes.
+
 ## Going live (step by step)
 
 The bot has **not** been run against live Shredstream and orders by its authors; the Pump.fun instructions were only checked with `simulateTransaction`. Go slowly and only risk money you can lose.
 
 1. **Use a new wallet.** Create a wallet only for the bot and fund it with 0.1-0.2 SOL at most. Any key that was ever in this repository's old history must be treated as compromised: move the funds and revoke it. Never commit `.env`.
 2. **Tools.** Rust (`rust-toolchain.toml` installs 1.89 by itself), Node.js, and `protoc` with the `PROTOC` environment variable pointing to it (the build needs it).
-3. **Endpoints.** A mainnet RPC with good limits (`RPC_URL`), an Astralane sender with your key (`ASTRALANE_URL`) and a Jito ShredStream proxy (`SHREDSTREAM_URL`, gRPC, usually port 9999; Jito must approve your access).
+3. **Endpoints.** A mainnet RPC with good limits (`RPC_URL`), an Astralane sender with your key (`ASTRALANE_URL`) and a shred feed (`SHREDSTREAM_URL`, see [Where to get the shred feed](#where-to-get-the-shred-feed-shredstream_url)).
 4. **`.env`.** Copy `.example.env` and fill in `PVT_KEY`, the three URLs and `API_TOKEN` (16+ characters). Start conservative:
    ```
    SOL_BUY_AMOUNT=0.01
