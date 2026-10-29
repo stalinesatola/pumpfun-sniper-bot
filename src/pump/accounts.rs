@@ -37,8 +37,10 @@ impl<'a> Cursor<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BondingCurve {
     pub virtual_token_reserves: u64,
-    /// Virtual reserves of the quote asset (lamports for SOL, millionths for USDC).
-    pub virtual_quote_reserves: u64,
+    /// Virtual reserves of the quote asset (lamports for SOL, millionths for USDC). Signed:
+    /// since 30 Sep 2026 the fees kept on the curve are subtracted from it, so it can be
+    /// negative (the IDL still calls it u64).
+    pub virtual_quote_reserves: i64,
     pub real_token_reserves: u64,
     pub real_quote_reserves: u64,
     pub token_total_supply: u64,
@@ -56,7 +58,7 @@ impl BondingCurve {
         }
         let mut c = Cursor::new(data, 8);
         let virtual_token_reserves = c.u64()?;
-        let virtual_quote_reserves = c.u64()?;
+        let virtual_quote_reserves = c.u64()? as i64;
         let real_token_reserves = c.u64()?;
         let real_quote_reserves = c.u64()?;
         let token_total_supply = c.u64()?;
@@ -89,7 +91,7 @@ impl BondingCurve {
     /// Price of one whole token (6 decimals) in whole quote units (9 decimals for SOL, 6 for
     /// USDC), from the virtual reserves. `None` when the curve is empty.
     pub fn price(&self, quote_decimals: u32) -> Option<f64> {
-        if self.virtual_token_reserves == 0 {
+        if self.virtual_token_reserves == 0 || self.virtual_quote_reserves <= 0 {
             return None;
         }
         let per_raw = self.virtual_quote_reserves as f64 / self.virtual_token_reserves as f64;
@@ -99,11 +101,14 @@ impl BondingCurve {
     /// Tokens (raw units) that `quote_in` buys right now, ignoring fees (a slight
     /// overestimate; the program takes its fee out of the spend).
     pub fn tokens_for_quote(&self, quote_in: u64) -> Option<u64> {
+        if self.virtual_quote_reserves <= 0 {
+            return None;
+        }
         let (vt, vq) = (
             self.virtual_token_reserves as u128,
             self.virtual_quote_reserves as u128,
         );
-        if vt == 0 || vq == 0 {
+        if vt == 0 {
             return None;
         }
         let out = vt - vt * vq / (vq + quote_in as u128);
@@ -225,5 +230,18 @@ mod tests {
             ..c
         };
         assert!(empty.price(9).is_none() && empty.tokens_for_quote(1).is_none());
+        // Negative virtual quote reserves (fees kept on the curve) are not priced, not
+        // read as a huge positive number.
+        let negative = BondingCurve {
+            virtual_quote_reserves: -5,
+            ..c
+        };
+        assert!(negative.price(9).is_none() && negative.tokens_for_quote(1).is_none());
+        let mut raw = curve_bytes(false, None);
+        raw[16..24].copy_from_slice(&(-5i64).to_le_bytes());
+        assert_eq!(
+            BondingCurve::decode(&raw).unwrap().virtual_quote_reserves,
+            -5
+        );
     }
 }
