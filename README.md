@@ -210,7 +210,7 @@ Two front ends share one live state, so they always agree: a **web panel** and a
 **Web panel**
 
 ```bash
-cd ui && npm install && npm run build   # once, and after changing the UI
+cd ui && npm install && npm run build   # once, and after every `git pull` that changes the UI (the bot warns when the build is older than ui/src)
 cargo run --release                     # then open http://127.0.0.1:8787
 ```
 

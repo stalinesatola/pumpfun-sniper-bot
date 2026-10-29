@@ -14,7 +14,7 @@ use rustls::crypto::aws_lc_rs::default_provider;
 use rustls::crypto::CryptoProvider;
 use shred_pool_cache::api::{self, ApiConfig};
 use shred_pool_cache::community::{self, CommunityConfig, LastBuy, NewToken};
-use shred_pool_cache::config::Config;
+use shred_pool_cache::config::{optional_parsed, Config};
 use shred_pool_cache::copy::{self, CopyConfig};
 use shred_pool_cache::pumpfun::PumpFunSDK;
 use shred_pool_cache::pumpswap::constants::PriorityFeePump;
@@ -111,6 +111,12 @@ async fn main() -> Result<()> {
         rules_store,
     ));
     log_configuration(&config, &state);
+    // The bot waits for the operator: nothing is bought until Resume is pressed in the
+    // dashboard (START_PAUSED=false restores the old behaviour).
+    if optional_parsed("START_PAUSED", true)? {
+        state.set_paused(true);
+        info!("Started PAUSED: press Resume in the dashboard to start trading (START_PAUSED=false to start running)");
+    }
     let trader = Trader::new(sdk, config.payer.insecure_clone(), state.clone());
 
     if let Some(api_config) = api_config {
