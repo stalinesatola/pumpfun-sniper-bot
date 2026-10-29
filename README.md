@@ -203,6 +203,32 @@ cargo run --release
 
 Use `--release`. Debug builds are too slow for slot-race sniping.
 
+## Going live (step by step)
+
+The bot has **not** been run against live Shredstream and orders by its authors; the Pump.fun instructions were only checked with `simulateTransaction`. Go slowly and only risk money you can lose.
+
+1. **Use a new wallet.** Create a wallet only for the bot and fund it with 0.1-0.2 SOL at most. Any key that was ever in this repository's old history must be treated as compromised: move the funds and revoke it. Never commit `.env`.
+2. **Tools.** Rust (`rust-toolchain.toml` installs 1.89 by itself), Node.js, and `protoc` with the `PROTOC` environment variable pointing to it (the build needs it).
+3. **Endpoints.** A mainnet RPC with good limits (`RPC_URL`), an Astralane sender with your key (`ASTRALANE_URL`) and a Jito ShredStream proxy (`SHREDSTREAM_URL`, gRPC, usually port 9999; Jito must approve your access).
+4. **`.env`.** Copy `.example.env` and fill in `PVT_KEY`, the three URLs and `API_TOKEN` (16+ characters). Start conservative:
+   ```
+   SOL_BUY_AMOUNT=0.01
+   BRIBE_FEE=0.0001
+   MAX_OPEN_POSITIONS=1
+   MAX_SESSION_SPEND_SOL=0.05
+   MAX_SESSION_DRAWDOWN_SOL=0.03
+   REQUIRE_COMMUNITY=true
+   ```
+   Leave `COPY_WALLETS` empty at first. Fees are per transaction (tip + priority fee), so tiny buys are mostly fees: the dashboard shows the estimate.
+5. **Build.** `cd ui && npm install && npm run build`, then `cargo build --release`.
+6. **Check without spending.** Try the dashboard with `cargo run --example demo`, and check your RPC and the instructions with `RPC_URL=... cargo run --example probe -- <mint> <funded wallet>` (a simulation, nothing is sent).
+7. **Start.** `cargo run --release`. The logs should show "Read the Pump.fun global settings", the Shredstream connection, "Started PAUSED" and the dashboard address.
+8. **Validate the feed while paused.** Log in to the dashboard: "creates seen" should keep rising even though the bot is paused. If it does not, the Shredstream or the launch detection is not working; do not resume.
+9. **First trade.** Choose *Buy & sell*, press **Resume** and watch one buy and its sell (Solscan and the balance). Use Pause at any time.
+10. **Stop.** Pause, then Ctrl+C. Positions still held stay in the wallet.
+
+Known limits: tokens paired with USDC are only tracked (not bought); tokens that already moved to PumpSwap cannot be sold by the bot yet; instructions behind address lookup tables or CPI are not seen on the feed.
+
 ## Dashboard (web and terminal)
 
 Two front ends share one live state, so they always agree: a **web panel** and a **terminal UI**. The trading loop only publishes events; it never waits for either, so a slow browser cannot delay a buy.
